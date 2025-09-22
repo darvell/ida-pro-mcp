@@ -5,11 +5,18 @@ if sys.version_info < (3, 11):
     raise RuntimeError("Python 3.11 or higher is required for the MCP plugin")
 
 import json
+import socket
+import socketserver
 import struct
 import threading
 import http.server
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Callable, get_type_hints, TypedDict, Optional, Annotated, TypeVar, Generic, NotRequired
+
+from contextlib import suppress
 
 
 class JSONRPCError(Exception):
@@ -186,25 +193,116 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
         # Suppress logging
         pass
 
-class MCPHTTPServer(http.server.HTTPServer):
+class UnixJSONRPCServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     allow_reuse_address = False
+    daemon_threads = True
+
+    def __init__(self, socket_path: str, request_handler: type[http.server.BaseHTTPRequestHandler]):
+        self.socket_path = socket_path
+        self.RequestHandlerClass = request_handler
+        socketserver.UnixStreamServer.__init__(self, socket_path, request_handler)
+        self.server_name = "unix"
+        self.server_port = 0
+
+    def server_bind(self):
+        if os.path.exists(self.socket_path):
+            try:
+                os.unlink(self.socket_path)
+            except OSError:
+                pass
+        super().server_bind()
+
+    def server_close(self):
+        super().server_close()
+        with suppress(FileNotFoundError):
+            os.unlink(self.socket_path)
+
+    def get_request(self):
+        request, _ = super().get_request()
+        return request, ("local", 0)
+
+
+INSTANCE_RUNTIME_ENV = "IDA_PRO_MCP_RUNTIME_DIR"
+
+
+def _get_runtime_directory() -> Path:
+    base_dir = os.environ.get(INSTANCE_RUNTIME_ENV)
+    if base_dir:
+        root = Path(base_dir)
+    else:
+        root = Path(os.path.expanduser("~")) / ".ida-pro-mcp"
+    instances_dir = root / "instances"
+    instances_dir.mkdir(parents=True, exist_ok=True)
+    return instances_dir
+
+
+def _sanitize_filename(name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in (".", "-", "_") else "_" for ch in name)
+
+
+def _get_idb_path() -> str:
+    try:
+        import ida_nalt
+
+        return ida_nalt.get_path(ida_nalt.PATH_TYPE_IDB)
+    except Exception:
+        try:
+            return idaapi.get_path(idaapi.PATH_TYPE_IDB)
+        except Exception:
+            return ""
+
+
+def _build_instance_metadata(status: str, loaded_at: float) -> dict[str, Any]:
+    idb_path = _get_idb_path()
+    database_filename = os.path.basename(idb_path) if idb_path else idaapi.get_root_filename()
+    loaded_at_iso = datetime.fromtimestamp(loaded_at, tz=timezone.utc).isoformat()
+    return {
+        "database": database_filename,
+        "status": status,
+        "loaded_at": loaded_at_iso,
+        "module": idaapi.get_root_filename(),
+        "input_path": idaapi.get_input_file_path(),
+        "idb_path": idb_path,
+        "pid": os.getpid(),
+    }
+
+
+ACTIVE_SERVER: Optional["Server"] = None
+
 
 class Server:
-    HOST = "localhost"
-    PORT = 13337
-
     def __init__(self):
-        self.server = None
-        self.server_thread = None
+        global ACTIVE_SERVER
+        self.server: Optional["UnixJSONRPCServer"] = None
+        self.server_thread: Optional[threading.Thread] = None
         self.running = False
+        self.loaded_at: Optional[float] = None
+        self.socket_path: Optional[Path] = None
+        self.status: str = "stopped"
+        ACTIVE_SERVER = self
 
     def start(self):
         if self.running:
             print("[MCP] Server is already running")
             return
 
-        self.server_thread = threading.Thread(target=self._run_server, daemon=True)
+        try:
+            runtime_dir = _get_runtime_directory()
+            self.loaded_at = time.time()
+            metadata = _build_instance_metadata("starting", self.loaded_at)
+            safe_name = _sanitize_filename(metadata["database"] or "ida")
+            socket_path = runtime_dir / f"{os.getpid()}_{safe_name}.sock"
+            self.socket_path = socket_path
+            self.server = UnixJSONRPCServer(str(socket_path), JSONRPCRequestHandler)
+        except OSError as e:
+            print(f"[MCP] Server error: {e}")
+            self.loaded_at = None
+            self.socket_path = None
+            return
+
         self.running = True
+        self.status = "starting"
+        self.server_thread = threading.Thread(target=self._run_server, daemon=True)
         self.server_thread.start()
 
     def stop(self):
@@ -218,24 +316,33 @@ class Server:
         if self.server_thread:
             self.server_thread.join()
             self.server = None
+        self.status = "stopped"
+        self.loaded_at = None
+        self.socket_path = None
         print("[MCP] Server stopped")
 
     def _run_server(self):
         try:
-            # Create server in the thread to handle binding
-            self.server = MCPHTTPServer((Server.HOST, Server.PORT), JSONRPCRequestHandler)
-            print(f"[MCP] Server started at http://{Server.HOST}:{Server.PORT}")
+            assert self.server is not None
+            assert self.socket_path is not None
+            print(f"[MCP] Server started at unix://{self.socket_path}")
+            self.status = "ready"
             self.server.serve_forever()
         except OSError as e:
-            if e.errno == 98 or e.errno == 10048:  # Port already in use (Linux/Windows)
-                print("[MCP] Error: Port 13337 is already in use")
-            else:
-                print(f"[MCP] Server error: {e}")
+            print(f"[MCP] Server error: {e}")
             self.running = False
         except Exception as e:
             print(f"[MCP] Server error: {e}")
         finally:
             self.running = False
+            if self.status != "stopped":
+                self.status = "stopped"
+            self.loaded_at = None
+
+    def describe_instance(self) -> dict[str, Any]:
+        if self.loaded_at is None:
+            raise IDAError("MCP server is not ready")
+        return _build_instance_metadata(self.status, self.loaded_at)
 
 # A module that helps with writing thread safe ida code.
 # Based on:
@@ -402,6 +509,37 @@ class Metadata(TypedDict):
     sha256: str
     crc32: str
     filesize: str
+
+
+class InstanceDescription(TypedDict):
+    database: str
+    status: str
+    loaded_at: str
+    module: str
+    input_path: str
+    idb_path: str
+    pid: int
+
+
+@idaread
+def describe_instance() -> InstanceDescription:
+    """Describe the current MCP instance (internal use)."""
+    if ACTIVE_SERVER is None:
+        raise IDAError("MCP server is not initialized")
+    data = ACTIVE_SERVER.describe_instance()
+    return InstanceDescription(
+        database=str(data.get("database", "")),
+        status=str(data.get("status", "unknown")),
+        loaded_at=str(data.get("loaded_at", "")),
+        module=str(data.get("module", "")),
+        input_path=str(data.get("input_path", "")),
+        idb_path=str(data.get("idb_path", "")),
+        pid=int(data.get("pid", os.getpid())),
+    )
+
+
+rpc_registry.register(describe_instance)
+
 
 def get_image_size() -> int:
     try:

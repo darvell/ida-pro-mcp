@@ -5,6 +5,11 @@ import json
 import shutil
 import argparse
 import http.client
+import socket
+import errno
+from contextlib import suppress
+from pathlib import Path
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 from urllib.parse import urlparse
 from glob import glob
 
@@ -14,17 +19,36 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("ida-pro-mcp", log_level="ERROR")
 
 jsonrpc_request_id = 1
-ida_host = "127.0.0.1"
-ida_port = 13337
 
-def make_jsonrpc_request(method: str, *params):
-    """Make a JSON-RPC request to the IDA plugin"""
-    global jsonrpc_request_id, ida_host, ida_port
-    conn = http.client.HTTPConnection(ida_host, ida_port)
+INSTANCE_RUNTIME_ENV = "IDA_PRO_MCP_RUNTIME_DIR"
+_runtime_root = os.environ.get(INSTANCE_RUNTIME_ENV)
+if _runtime_root:
+    INSTANCE_REGISTRY_DIR = Path(_runtime_root) / "instances"
+else:
+    INSTANCE_REGISTRY_DIR = Path.home() / ".ida-pro-mcp" / "instances"
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path: str, timeout: float = 10):
+        super().__init__("localhost", timeout=timeout)
+        self.unix_path = path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self.timeout is not None:
+            sock.settimeout(self.timeout)
+        sock.connect(self.unix_path)
+        self.sock = sock
+
+
+def _send_jsonrpc_request(socket_path: str, method: str, params: List[Any]) -> Any:
+    global jsonrpc_request_id
+
+    conn = UnixHTTPConnection(socket_path, timeout=10)
     request = {
         "jsonrpc": "2.0",
         "method": method,
-        "params": list(params),
+        "params": params,
         "id": jsonrpc_request_id,
     }
     jsonrpc_request_id += 1
@@ -34,39 +58,174 @@ def make_jsonrpc_request(method: str, *params):
             "Content-Type": "application/json"
         })
         response = conn.getresponse()
-        data = json.loads(response.read().decode())
-
-        if "error" in data:
-            error = data["error"]
-            code = error["code"]
-            message = error["message"]
-            pretty = f"JSON-RPC error {code}: {message}"
-            if "data" in error:
-                pretty += "\n" + error["data"]
-            raise Exception(pretty)
-
-        result = data["result"]
-        # NOTE: LLMs do not respond well to empty responses
-        if result is None:
-            result = "success"
-        return result
-    except Exception:
-        raise
+        payload = response.read().decode()
+        data = json.loads(payload)
     finally:
         conn.close()
 
-@mcp.tool()
-def check_connection() -> str:
-    """Check if the IDA plugin is running"""
+    if "error" in data:
+        error = data["error"]
+        code = error.get("code")
+        message = error.get("message", "unknown error")
+        pretty = f"JSON-RPC error {code}: {message}"
+        if "data" in error:
+            pretty += "\n" + str(error["data"])
+        raise Exception(pretty)
+
+    result = data.get("result")
+    if result is None:
+        result = "success"
+    return result
+
+
+class InstanceManager:
+    _instances: Dict[str, Dict[str, Any]] = {}
+    _loaded: bool = False
+
+    @staticmethod
+    def _probe_socket(path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            metadata = _send_jsonrpc_request(str(path), "describe_instance", [])
+        except FileNotFoundError:
+            with suppress(FileNotFoundError):
+                path.unlink()
+            return None
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ECONNREFUSED):
+                with suppress(FileNotFoundError):
+                    path.unlink()
+            return None
+        except Exception:
+            return None
+
+        if not isinstance(metadata, dict):
+            return None
+
+        database = metadata.get("database")
+        if not isinstance(database, str) or not database:
+            return None
+
+        metadata = dict(metadata)
+        metadata["_socket"] = str(path)
+        return metadata
+
+    @classmethod
+    def refresh(cls) -> None:
+        cls._instances = {}
+        cls._loaded = True
+        if not INSTANCE_REGISTRY_DIR.exists():
+            return
+
+        for socket_path in INSTANCE_REGISTRY_DIR.glob("*.sock"):
+            record = cls._probe_socket(socket_path)
+            if record is None:
+                continue
+            cls._instances[record["database"]] = record
+
+    @classmethod
+    def _ensure_loaded(cls) -> None:
+        if not cls._loaded:
+            cls.refresh()
+
+    @classmethod
+    def list(cls) -> List[Dict[str, Any]]:
+        cls.refresh()
+        records = list(cls._instances.values())
+        records.sort(key=lambda item: item.get("loaded_at", ""))
+        return records
+
+    @classmethod
+    def get(cls, database: str) -> Dict[str, Any]:
+        cls._ensure_loaded()
+        record = cls._instances.get(database)
+        if record is None:
+            cls.refresh()
+            record = cls._instances.get(database)
+        if record is None:
+            raise KeyError(database)
+        return record
+
+    @classmethod
+    def invalidate(cls, database: str) -> None:
+        cls._instances.pop(database, None)
+
+def make_jsonrpc_request(database: str, method: str, *params):
+    """Make a JSON-RPC request to a specific IDA plugin instance"""
     try:
-        metadata = make_jsonrpc_request("get_metadata")
-        return f"Successfully connected to IDA Pro (open file: {metadata['module']})"
+        instance = InstanceManager.get(database)
+    except KeyError:
+        raise Exception(
+            f"No IDA instance registered for database '{database}'. "
+            "Use the list_instances tool to see active sessions.",
+        )
+
+    socket_path = instance.get("_socket")
+    if not isinstance(socket_path, str) or not socket_path:
+        raise Exception(
+            f"Invalid registration for '{database}' (missing socket). "
+            "Try restarting the MCP plugin inside IDA.",
+        )
+
+    try:
+        return _send_jsonrpc_request(socket_path, method, list(params))
+    except OSError as e:
+        InstanceManager.invalidate(database)
+        raise Exception(
+            f"Failed to communicate with IDA instance '{database}': {e}. "
+            "Use the list_instances tool to verify that the instance is still running.",
+        ) from e
+    except Exception:
+        raise
+
+@mcp.tool()
+def check_connection(database: Annotated[str, "Database filename of the IDA instance to query"]) -> str:
+    """Check if a specific IDA plugin instance is running"""
+    try:
+        metadata = make_jsonrpc_request(database, "get_metadata")
+        return (
+            f"Successfully connected to '{database}' (open module: {metadata['module']})"
+        )
     except Exception as e:
         if sys.platform == "darwin":
             shortcut = "Ctrl+Option+M"
         else:
             shortcut = "Ctrl+Alt+M"
-        return f"Failed to connect to IDA Pro! Did you run Edit -> Plugins -> MCP ({shortcut}) to start the server?"
+        return (
+            f"Failed to connect to IDA instance '{database}': {e} "
+            f"Use the list_instances tool to verify running sessions or start the plugin via Edit -> Plugins -> MCP ({shortcut})."
+        )
+
+
+class InstanceSummary(TypedDict, total=False):
+    database: str
+    status: str
+    loaded_at: str
+    module: Optional[str]
+    input_path: Optional[str]
+    idb_path: Optional[str]
+    pid: Optional[int]
+    runtime_socket: str
+
+
+@mcp.tool()
+def list_instances() -> List[InstanceSummary]:
+    """List all currently registered IDA MCP plugin instances"""
+    instances = InstanceManager.list()
+    summaries: List[InstanceSummary] = []
+    for instance in instances:
+        summaries.append(
+            InstanceSummary(
+                database=instance.get("database", "<unknown>"),
+                status=instance.get("status", "unknown"),
+                loaded_at=instance.get("loaded_at", ""),
+                module=instance.get("module"),
+                input_path=instance.get("input_path"),
+                idb_path=instance.get("idb_path"),
+                pid=instance.get("pid"),
+                runtime_socket=instance.get("_socket", ""),
+            )
+        )
+    return summaries
 
 # Code taken from https://github.com/mrexodia/ida-pro-mcp (MIT License)
 class MCPVisitor(ast.NodeVisitor):
@@ -80,6 +239,23 @@ class MCPVisitor(ast.NodeVisitor):
         for decorator in node.decorator_list:
             if isinstance(decorator, ast.Name):
                 if decorator.id == "jsonrpc":
+                    database_arg = ast.arg(
+                        arg="database",
+                        annotation=ast.Subscript(
+                            value=ast.Name(id="Annotated", ctx=ast.Load()),
+                            slice=ast.Tuple(
+                                elts=[
+                                    ast.Name(id="str", ctx=ast.Load()),
+                                    ast.Constant(
+                                        value="Database filename of the IDA instance to query",
+                                    ),
+                                ],
+                                ctx=ast.Load(),
+                            ),
+                            ctx=ast.Load(),
+                        ),
+                        type_comment=None,
+                    )
                     for i, arg in enumerate(node.args.args):
                         arg_name = arg.arg
                         arg_type = arg.annotation
@@ -119,7 +295,7 @@ class MCPVisitor(ast.NodeVisitor):
                     else:
                         new_body = []
 
-                    call_args = [ast.Constant(value=node.name)]
+                    call_args = [ast.Name(id="database", ctx=ast.Load()), ast.Constant(value=node.name)]
                     for arg in node.args.args:
                         call_args.append(ast.Name(id=arg.arg, ctx=ast.Load()))
                     new_body.append(ast.Return(
@@ -137,7 +313,25 @@ class MCPVisitor(ast.NodeVisitor):
                             keywords=[]
                         )
                     ]
-                    node_nobody = ast.FunctionDef(node.name, node.args, new_body, decorator_list, node.returns, node.type_comment, lineno=node.lineno, col_offset=node.col_offset)
+                    new_args = ast.arguments(
+                        posonlyargs=list(node.args.posonlyargs),
+                        args=[database_arg] + list(node.args.args),
+                        vararg=node.args.vararg,
+                        kwonlyargs=list(node.args.kwonlyargs),
+                        kw_defaults=list(node.args.kw_defaults),
+                        kwarg=node.args.kwarg,
+                        defaults=list(node.args.defaults),
+                    )
+                    node_nobody = ast.FunctionDef(
+                        node.name,
+                        new_args,
+                        new_body,
+                        decorator_list,
+                        node.returns,
+                        node.type_comment,
+                        lineno=node.lineno,
+                        col_offset=node.col_offset,
+                    )
                     assert node.name not in self.functions, f"Duplicate function: {node.name}"
                     self.functions[node.name] = node_nobody
                 elif decorator.id == "unsafe":
@@ -196,15 +390,21 @@ except:
 
 exec(compile(code, GENERATED_PY, "exec"))
 
-MCP_FUNCTIONS = ["check_connection"] + list(visitor.functions.keys())
+MCP_FUNCTIONS = ["check_connection", "list_instances"] + list(visitor.functions.keys())
 UNSAFE_FUNCTIONS = visitor.unsafe
 SAFE_FUNCTIONS = [f for f in MCP_FUNCTIONS if f not in UNSAFE_FUNCTIONS]
 
 def generate_readme():
     print("README:")
-    print(f"- `check_connection()`: Check if the IDA plugin is running.")
+    print(
+        "- `check_connection(database)`: Check if the IDA plugin instance for"
+        " the given database filename is reachable."
+    )
+    print("- `list_instances()`: List all currently registered IDA databases.")
     def get_description(name: str):
-        function = visitor.functions[name]
+        function = visitor.functions.get(name)
+        if function is None:
+            return None
         signature = function.name + "("
         for i, arg in enumerate(function.args.args):
             if i > 0:
@@ -216,10 +416,14 @@ def generate_readme():
             description += "."
         return f"- `{signature}`: {description}"
     for safe_function in SAFE_FUNCTIONS:
-        print(get_description(safe_function))
+        description = get_description(safe_function)
+        if description is not None:
+            print(description)
     print("\nUnsafe functions (`--unsafe` flag required):\n")
     for unsafe_function in UNSAFE_FUNCTIONS:
-        print(get_description(unsafe_function))
+        description = get_description(unsafe_function)
+        if description is not None:
+            print(description)
     print("\nMCP Config:")
     mcp_config = {
         "mcpServers": {
@@ -455,14 +659,12 @@ def install_ida_plugin(*, uninstall: bool = False, quiet: bool = False):
                 print(f"Installed IDA Pro plugin (IDA restart required)\n  Plugin: {plugin_destination}")
 
 def main():
-    global ida_host, ida_port
     parser = argparse.ArgumentParser(description="IDA Pro MCP Server")
     parser.add_argument("--install", action="store_true", help="Install the MCP Server and IDA plugin")
     parser.add_argument("--uninstall", action="store_true", help="Uninstall the MCP Server and IDA plugin")
     parser.add_argument("--generate-docs", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--install-plugin", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--transport", type=str, default="stdio", help="MCP transport protocol to use (stdio or http://127.0.0.1:8744)")
-    parser.add_argument("--ida-rpc", type=str, default=f"http://{ida_host}:{ida_port}", help=f"IDA RPC server to use (default: http://{ida_host}:{ida_port})")
     parser.add_argument("--unsafe", action="store_true", help="Enable unsafe functions (DANGEROUS)")
     parser.add_argument("--config", action="store_true", help="Generate MCP config JSON")
     args = parser.parse_args()
@@ -493,13 +695,6 @@ def main():
     if args.config:
         print_mcp_config()
         return
-
-    # Parse IDA RPC server argument
-    ida_rpc = urlparse(args.ida_rpc)
-    if ida_rpc.hostname is None or ida_rpc.port is None:
-        raise Exception(f"Invalid IDA RPC server: {args.ida_rpc}")
-    ida_host = ida_rpc.hostname
-    ida_port = ida_rpc.port
 
     # Remove unsafe tools
     if not args.unsafe:
