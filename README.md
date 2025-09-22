@@ -8,45 +8,47 @@ The binaries and prompt for the video are available in the [mcp-reversing-datase
 
 Available functionality:
 
-- `check_connection()`: Check if the IDA plugin is running.
-- `get_metadata()`: Get metadata about the current IDB.
-- `get_function_by_name(name)`: Get a function by its name.
-- `get_function_by_address(address)`: Get a function by its address.
-- `get_current_address()`: Get the address currently selected by the user.
-- `get_current_function()`: Get the function currently selected by the user.
-- `convert_number(text, size)`: Convert a number (decimal, hexadecimal) to different representations.
-- `list_functions(offset, count)`: List all functions in the database (paginated).
-- `list_globals_filter(offset, count, filter)`: List matching globals in the database (paginated, filtered).
-- `list_globals(offset, count)`: List all globals in the database (paginated).
-- `list_strings_filter(offset, count, filter)`: List matching strings in the database (paginated, filtered).
-- `list_strings(offset, count)`: List all strings in the database (paginated).
-- `list_local_types()`: List all Local types in the database.
-- `decompile_function(address)`: Decompile a function at the given address.
-- `disassemble_function(start_address)`: Get assembly code (address: instruction; comment) for a function.
-- `get_xrefs_to(address)`: Get all cross references to the given address.
-- `get_xrefs_to_field(struct_name, field_name)`: Get all cross references to a named struct field (member).
-- `get_entry_points()`: Get all entry points in the database.
-- `set_comment(address, comment)`: Set a comment for a given address in the function disassembly and pseudocode.
-- `rename_local_variable(function_address, old_name, new_name)`: Rename a local variable in a function.
-- `rename_global_variable(old_name, new_name)`: Rename a global variable.
-- `set_global_variable_type(variable_name, new_type)`: Set a global variable's type.
-- `rename_function(function_address, new_name)`: Rename a function.
-- `set_function_prototype(function_address, prototype)`: Set a function's prototype.
-- `declare_c_type(c_declaration)`: Create or update a local type from a C declaration.
-- `set_local_variable_type(function_address, variable_name, new_type)`: Set a local variable's type.
+- `list_instances()`: List all IDA Pro databases currently registered by the MCP plugin along with their status, load time, PID, and runtime socket path.
+- `check_connection(database)`: Check if the IDA plugin instance handling `database` is running.
+- **Important**: Every other tool accepts the target `database` filename as its first argument so the correct IDA instance is used.
+- `get_metadata(database)`: Get metadata about the current IDB.
+- `get_function_by_name(database, name)`: Get a function by its name.
+- `get_function_by_address(database, address)`: Get a function by its address.
+- `get_current_address(database)`: Get the address currently selected by the user.
+- `get_current_function(database)`: Get the function currently selected by the user.
+- `convert_number(database, text, size)`: Convert a number (decimal, hexadecimal) to different representations.
+- `list_functions(database, offset, count)`: List all functions in the database (paginated).
+- `list_globals_filter(database, offset, count, filter)`: List matching globals in the database (paginated, filtered).
+- `list_globals(database, offset, count)`: List all globals in the database (paginated).
+- `list_strings_filter(database, offset, count, filter)`: List matching strings in the database (paginated, filtered).
+- `list_strings(database, offset, count)`: List all strings in the database (paginated).
+- `list_local_types(database)`: List all Local types in the database.
+- `decompile_function(database, address)`: Decompile a function at the given address.
+- `disassemble_function(database, start_address)`: Get assembly code (address: instruction; comment) for a function.
+- `get_xrefs_to(database, address)`: Get all cross references to the given address.
+- `get_xrefs_to_field(database, struct_name, field_name)`: Get all cross references to a named struct field (member).
+- `get_entry_points(database)`: Get all entry points in the database.
+- `set_comment(database, address, comment)`: Set a comment for a given address in the function disassembly and pseudocode.
+- `rename_local_variable(database, function_address, old_name, new_name)`: Rename a local variable in a function.
+- `rename_global_variable(database, old_name, new_name)`: Rename a global variable.
+- `set_global_variable_type(database, variable_name, new_type)`: Set a global variable's type.
+- `rename_function(database, function_address, new_name)`: Rename a function.
+- `set_function_prototype(database, function_address, prototype)`: Set a function's prototype.
+- `declare_c_type(database, c_declaration)`: Create or update a local type from a C declaration.
+- `set_local_variable_type(database, function_address, variable_name, new_type)`: Set a local variable's type.
 
 Unsafe functions (`--unsafe` flag required):
 
-- `dbg_get_registers()`: Get all registers and their values. This function is only available when debugging.
-- `dbg_get_call_stack()`: Get the current call stack.
-- `dbg_list_breakpoints()`: List all breakpoints in the program.
-- `dbg_start_process()`: Start the debugger.
-- `dbg_exit_process()`: Exit the debugger.
-- `dbg_continue_process()`: Continue the debugger.
-- `dbg_run_to(address)`: Run the debugger to the specified address.
-- `dbg_set_breakpoint(address)`: Set a breakpoint at the specified address.
-- `dbg_delete_breakpoint(address)`: del a breakpoint at the specified address.
-- `dbg_enable_breakpoint(address, enable)`: Enable or disable a breakpoint at the specified address.
+- `dbg_get_registers(database)`: Get all registers and their values. This function is only available when debugging.
+- `dbg_get_call_stack(database)`: Get the current call stack.
+- `dbg_list_breakpoints(database)`: List all breakpoints in the program.
+- `dbg_start_process(database)`: Start the debugger.
+- `dbg_exit_process(database)`: Exit the debugger.
+- `dbg_continue_process(database)`: Continue the debugger.
+- `dbg_run_to(database, address)`: Run the debugger to the specified address.
+- `dbg_set_breakpoint(database, address)`: Set a breakpoint at the specified address.
+- `dbg_delete_breakpoint(database, address)`: del a breakpoint at the specified address.
+- `dbg_enable_breakpoint(database, address, enable)`: Enable or disable a breakpoint at the specified address.
 
 ## Prerequisites
 
