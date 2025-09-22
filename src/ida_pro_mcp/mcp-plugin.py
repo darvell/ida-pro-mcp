@@ -4,6 +4,7 @@ import sys
 if sys.version_info < (3, 11):
     raise RuntimeError("Python 3.11 or higher is required for the MCP plugin")
 
+import io
 import json
 import socket
 import socketserver
@@ -16,7 +17,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Callable, get_type_hints, TypedDict, Optional, Annotated, TypeVar, Generic, NotRequired
 
-from contextlib import suppress
+from contextlib import suppress, redirect_stdout, redirect_stderr
+import traceback
 
 
 class JSONRPCError(Exception):
@@ -416,6 +418,7 @@ class IDASafety:
     SAFE_WRITE = ida_kernwin.MFF_WRITE
 
 call_stack = queue.LifoQueue()
+SCRIPT_EXECUTION_GLOBALS: dict[str, Any] = {}
 
 def sync_wrapper(ff, safety_mode: IDASafety):
     """
@@ -519,6 +522,13 @@ class InstanceDescription(TypedDict):
     input_path: str
     idb_path: str
     pid: int
+
+
+class PythonScriptResult(TypedDict):
+    stdout: str
+    stderr: str
+    success: bool
+    error: Optional[str]
 
 
 @idaread
@@ -2092,6 +2102,45 @@ def data_read_string(
         return idaapi.get_strlit_contents(parse_address(address),-1,0).decode("utf-8")
     except Exception as e:
         return "Error:" + str(e)
+
+
+@jsonrpc
+@idawrite
+@unsafe
+def execute_python_script(
+    script: Annotated[str, "Python script to execute"],
+) -> PythonScriptResult:
+    """Execute a Python script inside IDA and capture its output."""
+
+    global SCRIPT_EXECUTION_GLOBALS
+
+    if not SCRIPT_EXECUTION_GLOBALS:
+        SCRIPT_EXECUTION_GLOBALS = {
+            "__name__": "__mcp_script__",
+            "__builtins__": __builtins__,
+        }
+        SCRIPT_EXECUTION_GLOBALS.update(globals())
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    success = True
+    error: Optional[str] = None
+
+    with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+        try:
+            exec(compile(script, "<mcp-script>", "exec"), SCRIPT_EXECUTION_GLOBALS)
+        except Exception as exc:
+            success = False
+            error = str(exc)
+            traceback.print_exc(file=stderr_buffer)
+
+    return PythonScriptResult(
+        stdout=stdout_buffer.getvalue(),
+        stderr=stderr_buffer.getvalue(),
+        success=success,
+        error=error,
+    )
+
 
 @jsonrpc
 @idaread
