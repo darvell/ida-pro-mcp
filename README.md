@@ -10,6 +10,7 @@ Available functionality:
 
 - `list_instances()`: List all IDA Pro databases currently registered by the MCP plugin along with their status, load time, PID, and runtime socket path.
 - `check_connection(database)`: Check if the IDA plugin instance handling `database` is running.
+- `batch_tool_calls(requests, page=1, page_size_tokens=25000, allow_unsafe=False)`: Execute multiple MCP tool calls in one request and automatically paginate the combined results when they exceed ~25k tokens.
 - **Important**: Every other tool accepts the target `database` filename as its first argument so the correct IDA instance is used.
 - `get_metadata(database)`: Get metadata about the current IDB.
 - `get_function_by_name(database, name)`: Get a function by its name.

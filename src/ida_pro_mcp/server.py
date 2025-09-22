@@ -9,7 +9,7 @@ import socket
 import errno
 from contextlib import suppress
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, TypedDict
+from typing import Annotated, Any, Callable, Dict, List, Optional, TypedDict
 from urllib.parse import urlparse
 from glob import glob
 
@@ -17,6 +17,8 @@ from mcp.server.fastmcp import FastMCP
 
 # The log_level is necessary for Cline to work: https://github.com/jlowin/fastmcp/issues/81
 mcp = FastMCP("ida-pro-mcp", log_level="ERROR")
+
+BATCH_TOOL_NAME = "batch_tool_calls"
 
 jsonrpc_request_id = 1
 
@@ -207,6 +209,77 @@ class InstanceSummary(TypedDict, total=False):
     runtime_socket: str
 
 
+class BatchToolRequest(TypedDict, total=False):
+    tool: str
+    arguments: Dict[str, Any]
+
+
+class BatchToolResult(TypedDict, total=False):
+    index: int
+    tool: str
+    status: str
+    arguments: Dict[str, Any]
+    output: Any
+    error: str
+    chunk_index: int
+    total_chunks: int
+    output_format: str
+
+
+def _coerce_to_jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _coerce_to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_coerce_to_jsonable(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    return repr(value)
+
+
+def _serialized_length(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False))
+    except TypeError:
+        return len(json.dumps(_coerce_to_jsonable(value), ensure_ascii=False))
+
+
+def _chunk_text(text: str, size: int) -> List[str]:
+    if size <= 0:
+        size = 1
+    if not text:
+        return [""]
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def _chunk_batch_result(entry: Dict[str, Any], char_limit: int) -> List[Dict[str, Any]]:
+    base_entry = dict(entry)
+    output = base_entry.pop("output", "")
+    base_entry.pop("chunk_index", None)
+    base_entry.pop("total_chunks", None)
+    base_entry.pop("output_format", None)
+    metadata_len = _serialized_length({**base_entry, "output": ""})
+    available_chars = max(1, char_limit - metadata_len - 2)
+    if isinstance(output, str):
+        raw_output = output
+        output_format = "text"
+    else:
+        raw_output = json.dumps(_coerce_to_jsonable(output), ensure_ascii=False)
+        output_format = "json-string"
+    chunks = _chunk_text(raw_output, available_chars)
+    total_chunks = len(chunks)
+    chunk_entries: List[Dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        chunk_entry = dict(base_entry)
+        chunk_entry["output"] = chunk
+        chunk_entry["chunk_index"] = idx
+        chunk_entry["total_chunks"] = total_chunks
+        chunk_entry["output_format"] = output_format
+        chunk_entries.append(chunk_entry)
+    return chunk_entries
+
+
 @mcp.tool()
 def list_instances() -> List[InstanceSummary]:
     """List all currently registered IDA MCP plugin instances"""
@@ -226,6 +299,146 @@ def list_instances() -> List[InstanceSummary]:
             )
         )
     return summaries
+
+
+@mcp.tool()
+def batch_tool_calls(
+    requests: Annotated[List[BatchToolRequest], "List of tool invocations to execute in order."],
+    page: Annotated[int, "1-based page number of the aggregated results to return."] = 1,
+    page_size_tokens: Annotated[
+        int,
+        "Approximate token budget per page (defaults to 25k tokens).",
+    ] = 25000,
+    allow_unsafe: Annotated[
+        bool,
+        "Allow execution of tools marked as unsafe by also passing this flag as True.",
+    ] = False,
+) -> Dict[str, Any]:
+    """Execute multiple MCP tools sequentially and return paginated results."""
+
+    if page <= 0:
+        raise ValueError("page must be a positive integer")
+    if page_size_tokens <= 0:
+        raise ValueError("page_size_tokens must be a positive integer")
+    if not isinstance(requests, list):
+        raise ValueError("requests must be provided as a list")
+
+    approx_char_limit = max(1, page_size_tokens) * 4
+    available_functions: Dict[str, Callable[..., Any]] = {}
+    for name in MCP_FUNCTIONS:
+        func = globals().get(name)
+        if callable(func):
+            available_functions[name] = func
+
+    results: List[BatchToolResult] = []
+    for idx, request in enumerate(requests, start=1):
+        if not isinstance(request, dict):
+            raise ValueError(f"Request #{idx} must be an object with tool information")
+
+        tool_name = request.get("tool")
+        if not isinstance(tool_name, str) or not tool_name:
+            raise ValueError(f"Request #{idx} is missing a valid tool name")
+        if tool_name == BATCH_TOOL_NAME:
+            raise ValueError("batch_tool_calls cannot invoke itself")
+        if tool_name not in available_functions:
+            raise ValueError(f"Unknown tool '{tool_name}' in request #{idx}")
+        if not allow_unsafe and tool_name in UNSAFE_FUNCTIONS:
+            raise ValueError(
+                f"Tool '{tool_name}' is marked as unsafe. Set allow_unsafe=True to execute it."
+            )
+
+        raw_arguments = request.get("arguments") or {}
+        if not isinstance(raw_arguments, dict):
+            raise ValueError(f"Request #{idx} arguments must be an object")
+
+        normalized_arguments = {str(key): value for key, value in raw_arguments.items()}
+        entry: BatchToolResult = BatchToolResult(
+            index=idx,
+            tool=tool_name,
+            status="success",
+            arguments=_coerce_to_jsonable(normalized_arguments),
+        )
+
+        func = available_functions[tool_name]
+        try:
+            output = func(**raw_arguments)
+        except Exception as exc:  # noqa: BLE001
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+        else:
+            entry["output"] = _coerce_to_jsonable(output)
+
+        results.append(entry)
+
+    if not results:
+        if page != 1:
+            raise ValueError("No results available")
+        return {
+            "page": 1,
+            "total_pages": 1,
+            "has_next": False,
+            "has_prev": False,
+            "page_size_tokens": page_size_tokens,
+            "approx_char_limit": approx_char_limit,
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "results": [],
+        }
+
+    pages: List[List[BatchToolResult]] = []
+    current_page: List[BatchToolResult] = []
+    current_length = 0
+
+    for entry in results:
+        entry_length = _serialized_length(entry)
+        if entry_length > approx_char_limit:
+            chunked_entries = _chunk_batch_result(entry, approx_char_limit)
+            for chunk in chunked_entries:
+                chunk_length = _serialized_length(chunk)
+                if current_page and current_length + chunk_length > approx_char_limit:
+                    pages.append(current_page)
+                    current_page = []
+                    current_length = 0
+                current_page.append(chunk)
+                current_length += chunk_length
+            continue
+
+        if current_page and current_length + entry_length > approx_char_limit:
+            pages.append(current_page)
+            current_page = []
+            current_length = 0
+
+        current_page.append(entry)
+        current_length += entry_length
+
+    if current_page:
+        pages.append(current_page)
+    if not pages:
+        pages.append([])
+
+    total_pages = len(pages)
+    if page > total_pages:
+        raise ValueError(f"Requested page {page} is out of range (max {total_pages})")
+
+    success_count = sum(1 for entry in results if entry["status"] == "success")
+    failure_count = len(results) - success_count
+
+    page_results = pages[page - 1]
+
+    return {
+        "page": page,
+        "total_pages": total_pages,
+        "has_next": page < total_pages,
+        "has_prev": page > 1,
+        "page_size_tokens": page_size_tokens,
+        "approx_char_limit": approx_char_limit,
+        "total_requests": len(results),
+        "successful_requests": success_count,
+        "failed_requests": failure_count,
+        "results": page_results,
+    }
+
 
 # Code taken from https://github.com/mrexodia/ida-pro-mcp (MIT License)
 class MCPVisitor(ast.NodeVisitor):
@@ -394,6 +607,11 @@ MCP_FUNCTIONS = ["check_connection", "list_instances"] + list(visitor.functions.
 UNSAFE_FUNCTIONS = visitor.unsafe
 SAFE_FUNCTIONS = [f for f in MCP_FUNCTIONS if f not in UNSAFE_FUNCTIONS]
 
+if BATCH_TOOL_NAME not in MCP_FUNCTIONS:
+    MCP_FUNCTIONS.append(BATCH_TOOL_NAME)
+    if BATCH_TOOL_NAME not in UNSAFE_FUNCTIONS:
+        SAFE_FUNCTIONS.append(BATCH_TOOL_NAME)
+
 def generate_readme():
     print("README:")
     print(
@@ -401,6 +619,10 @@ def generate_readme():
         " the given database filename is reachable."
     )
     print("- `list_instances()`: List all currently registered IDA databases.")
+    print(
+        "- `batch_tool_calls(requests, page=1, page_size_tokens=25000, allow_unsafe=False)`: "
+        "Execute multiple MCP tools sequentially and retrieve paginated results."
+    )
     def get_description(name: str):
         function = visitor.functions.get(name)
         if function is None:
