@@ -180,33 +180,23 @@ def make_jsonrpc_request(database: str, method: str, *params):
         raise
 
 @mcp.tool()
-def check_connection(database: Annotated[str, "Database filename of the IDA instance to query"]) -> str:
-    """Check if a specific IDA plugin instance is running"""
-    try:
-        metadata = make_jsonrpc_request(database, "get_metadata")
-        return (
-            f"Successfully connected to '{database}' (open module: {metadata['module']})"
-        )
-    except Exception as e:
-        if sys.platform == "darwin":
-            shortcut = "Ctrl+Option+M"
-        else:
-            shortcut = "Ctrl+Alt+M"
-        return (
-            f"Failed to connect to IDA instance '{database}': {e} "
-            f"Use the list_instances tool to verify running sessions or start the plugin via Edit -> Plugins -> MCP ({shortcut})."
-        )
+def check_connection() -> str:
+    """Check if any IDA instance is available"""
+    instances = InstanceManager.list()
+    if not instances:
+        return "No IDA instances running. Start IDA and load a file."
 
+    # Check if any instance is responsive
+    for instance in instances:
+        try:
+            database = instance.get("database", "")
+            if database:
+                metadata = make_jsonrpc_request(database, "get_metadata")
+                return f"Connected: {database} ({metadata.get('module', 'unknown')})"
+        except Exception:
+            continue
 
-class InstanceSummary(TypedDict, total=False):
-    database: str
-    status: str
-    loaded_at: str
-    module: Optional[str]
-    input_path: Optional[str]
-    idb_path: Optional[str]
-    pid: Optional[int]
-    runtime_socket: str
+    return f"Found {len(instances)} instance(s) but none responsive."
 
 
 class BatchToolRequest(TypedDict, total=False):
@@ -281,24 +271,20 @@ def _chunk_batch_result(entry: Dict[str, Any], char_limit: int) -> List[Dict[str
 
 
 @mcp.tool()
-def list_instances() -> List[InstanceSummary]:
+def list_instances() -> str:
     """List all currently registered IDA MCP plugin instances"""
     instances = InstanceManager.list()
-    summaries: List[InstanceSummary] = []
+    if not instances:
+        return "No IDA instances running."
+
+    results = []
     for instance in instances:
-        summaries.append(
-            InstanceSummary(
-                database=instance.get("database", "<unknown>"),
-                status=instance.get("status", "unknown"),
-                loaded_at=instance.get("loaded_at", ""),
-                module=instance.get("module"),
-                input_path=instance.get("input_path"),
-                idb_path=instance.get("idb_path"),
-                pid=instance.get("pid"),
-                runtime_socket=instance.get("_socket", ""),
-            )
-        )
-    return summaries
+        db = instance.get("database", "unknown")
+        module = instance.get("module", "unknown")
+        status = instance.get("status", "unknown")
+        results.append(f"{db} ({module}) - {status}")
+
+    return f"Active instances ({len(instances)}): " + ", ".join(results)
 
 
 @mcp.tool()
@@ -614,11 +600,8 @@ if BATCH_TOOL_NAME not in MCP_FUNCTIONS:
 
 def generate_readme():
     print("README:")
-    print(
-        "- `check_connection(database)`: Check if the IDA plugin instance for"
-        " the given database filename is reachable."
-    )
-    print("- `list_instances()`: List all currently registered IDA databases.")
+    print("- `check_connection()`: Check if any IDA instance is available.")
+    print("- `list_instances()`: List all currently registered IDA databases (compact format).")
     print(
         "- `batch_tool_calls(requests, page=1, page_size_tokens=25000, allow_unsafe=False)`: "
         "Execute multiple MCP tools sequentially and retrieve paginated results."
