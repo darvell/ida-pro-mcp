@@ -12,6 +12,7 @@ import struct
 import threading
 import http.server
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -374,6 +375,12 @@ import ida_dbg
 import ida_name
 import ida_ida
 import ida_frame
+try:
+    import ida_enum
+    IDA_ENUM_AVAILABLE = True
+except ImportError:
+    IDA_ENUM_AVAILABLE = False
+import ida_segment
 
 class IDAError(Exception):
     def __init__(self, message: str):
@@ -490,9 +497,14 @@ def idaread(f):
 def is_window_active():
     """Returns whether IDA is currently active"""
     try:
-        from PyQt5.QtWidgets import QApplication
+        import PySide6
+        import PySide6.QtWidgets
+        from PySide6.QtGui import QApplication 
     except ImportError:
-        return False
+        try:
+            from PyQt5.QtWidgets import QApplication
+        except ImportError:
+            return False
 
     app = QApplication.instance()
     if app is None:
@@ -614,6 +626,69 @@ class Function(TypedDict):
     name: str
     size: str
 
+
+class Link(TypedDict, total=False):
+    rel: str
+    method: str
+    description: NotRequired[str]
+    params: NotRequired[dict]
+
+
+class FunctionGraphNode(TypedDict, total=False):
+    function: Function
+    callers: list
+    callees: list
+    depth: int
+    prototype: NotRequired[Optional[str]]
+    links: NotRequired[list]
+
+
+class FunctionGraph(TypedDict, total=False):
+    root: Function
+    direction: str
+    max_depth: int
+    total_nodes: int
+    nodes: list
+    links: NotRequired[list]
+
+
+class DataFlowReference(TypedDict, total=False):
+    name: NotRequired[str]
+    kind: str
+    address: NotRequired[str]
+    target: NotRequired[str]
+    type: NotRequired[str]
+    line: NotRequired[int]
+    text: NotRequired[str]
+    function: NotRequired[Function]
+
+
+class DataFlowVariable(TypedDict, total=False):
+    name: str
+    type: NotRequired[str]
+    storage: str
+    references: list
+
+
+class DataFlowSummary(TypedDict, total=False):
+    function: Function
+    locals: list
+    arguments: list
+    globals: list
+    call_sites: list
+    pseudocode: list
+    links: NotRequired[list]
+    notes: NotRequired[dict]
+
+
+class ProgramStructureMap(TypedDict, total=False):
+    summary: dict
+    segments: NotRequired[list]
+    structures: NotRequired[list]
+    enums: NotRequired[list]
+    functions: NotRequired[list]
+    links: NotRequired[list]
+
 def parse_address(address: str) -> int:
     try:
         return int(address, 0)
@@ -636,6 +711,100 @@ def get_function(address: int, *, raise_error=True) -> Function:
         name = ida_funcs.get_func_name(fn.start_ea)
 
     return Function(address=hex(address), name=name, size=hex(fn.end_ea - fn.start_ea))
+
+
+def _build_function_links(address: int) -> list[Link]:
+    addr_hex = hex(address)
+    return [
+        Link(rel="self", method="decompile_function", params={"address": addr_hex}),
+        Link(rel="graph", method="analyze_call_graph", params={"address": addr_hex}),
+        Link(rel="data-flow", method="analyze_data_flow", params={"address": addr_hex}),
+        Link(rel="disassembly", method="disassemble_function", params={"start_address": addr_hex}),
+    ]
+
+
+def _collect_callers(func: ida_funcs.func_t, limit: int | None = None) -> list[Function]:
+    callers: list[Function] = []
+    seen: set[int] = set()
+    for xref_ea in idautils.CodeRefsTo(func.start_ea, 0):
+        caller_func = idaapi.get_func(xref_ea)
+        if not caller_func:
+            continue
+        if caller_func.start_ea in seen:
+            continue
+        seen.add(caller_func.start_ea)
+        callers.append(get_function(caller_func.start_ea))
+        if limit is not None and len(callers) >= limit:
+            break
+    return callers
+
+
+def _collect_callees(func: ida_funcs.func_t, limit: int | None = None) -> list[Function]:
+    callees: list[Function] = []
+    seen: set[int] = set()
+    for item_ea in ida_funcs.func_item_iterator_t(func):
+        for xref_ea in idautils.CodeRefsFrom(item_ea, 0):
+            callee_func = idaapi.get_func(xref_ea)
+            if not callee_func:
+                continue
+            if callee_func.start_ea == func.start_ea:
+                continue
+            if callee_func.start_ea in seen:
+                continue
+            seen.add(callee_func.start_ea)
+            callees.append(get_function(callee_func.start_ea))
+            if limit is not None and len(callees) >= limit:
+                return callees
+    return callees
+
+
+def _parse_section_filter(section_text: str, include_xrefs: bool) -> list[str]:
+    available = [
+        "summary",
+        "callers",
+        "callees",
+        "globals",
+        "xrefs",
+        "decompilation",
+        "assembly",
+    ]
+    if section_text:
+        requested = []
+        for part in section_text.split(","):
+            part = part.strip().lower()
+            if not part:
+                continue
+            if part not in available:
+                raise IDAError(f"Unknown section '{part}'. Available sections: {', '.join(available)}")
+            requested.append(part)
+    else:
+        requested = [sec for sec in available if sec != "xrefs"]
+        if include_xrefs:
+            requested.append("xrefs")
+    if include_xrefs and "xrefs" not in requested:
+        requested.append("xrefs")
+    return requested
+
+
+def _identifier_in_line(line: str, identifier: str) -> bool:
+    line_lower = line.lower()
+    ident_lower = identifier.lower()
+    start = 0
+    length = len(ident_lower)
+    if length == 0:
+        return False
+    while True:
+        idx = line_lower.find(ident_lower, start)
+        if idx == -1:
+            return False
+        before_ok = idx == 0 or not (line_lower[idx - 1].isalnum() or line_lower[idx - 1] == "_")
+        after_idx = idx + length
+        after_ok = after_idx >= len(line_lower) or not (
+            line_lower[after_idx].isalnum() or line_lower[after_idx] == "_"
+        )
+        if before_ok and after_ok:
+            return True
+        start = idx + length
 
 DEMANGLED_TO_EA = {}
 
@@ -983,78 +1152,695 @@ def decompile_checked(address: int) -> ida_hexrays.cfunc_t:
 @idaread
 def decompile_function(
     address: Annotated[str, "Address of the function to decompile"],
-) -> str:
-    """Enhanced decompile function with assembly, cross-references, and contextual analysis"""
+    output_format: Annotated[str, "Output format: text (default), markdown, or json"] = "text",
+    sections: Annotated[
+        str,
+        "Comma-separated sections to include (summary, callers, callees, globals, xrefs, decompilation, assembly).",
+    ] = "",
+    max_callers: Annotated[int, "Maximum number of callers to include"] = 5,
+    max_callees: Annotated[int, "Maximum number of callees to include"] = 5,
+    max_globals: Annotated[int, "Maximum number of globals to include"] = 5,
+    include_xrefs: Annotated[bool, "Include cross references section"] = False,
+    max_xrefs: Annotated[int, "Maximum number of cross references to include"] = 20,
+) -> str | dict:
+    """Decompile a function with customizable output formats and sections."""
+
     addr = parse_address(address)
     func = idaapi.get_func(addr)
     if not func:
         raise IDAError(f"No function found at address {hex(addr)}")
 
-    # Get function info
-    func_name = func.get_name() if hasattr(func, 'get_name') else ida_funcs.get_func_name(func.start_ea)
+    output_kind = output_format.lower().strip() or "text"
+    if output_kind not in {"text", "markdown", "json"}:
+        raise IDAError("output_format must be 'text', 'markdown', or 'json'")
+
+    selected_sections = _parse_section_filter(sections, include_xrefs)
+
+    func_name = func.get_name() if hasattr(func, "get_name") else ida_funcs.get_func_name(func.start_ea)
     func_size = func.end_ea - func.start_ea
+    function_info = get_function(func.start_ea)
 
-    # Build compact output
-    output = [f"=== {func_name} @ {hex(func.start_ea)} | Size: {func_size}b ==="]
+    callers = _collect_callers(func, max_callers if max_callers > 0 else None)
+    callees = _collect_callees(func, max_callees if max_callees > 0 else None)
 
-    # Callers (limit 5)
-    callers = []
-    for i, caller_addr in enumerate(idautils.CodeRefsTo(func.start_ea, 0)):
-        if i >= 5: break
-        caller_func = idaapi.get_func(caller_addr)
-        if caller_func:
-            caller_name = caller_func.get_name() if hasattr(caller_func, 'get_name') else ida_funcs.get_func_name(caller_func.start_ea)
-            callers.append(f"{caller_name}@{hex(caller_addr)}")
-
-    output.append(f"Callers: {', '.join(callers) if callers else 'None'}")
-
-    # Callees (limit 5)
-    callees = set()
+    globals_found: list[dict] = []
+    seen_globals: set[int] = set()
     for ea in ida_funcs.func_item_iterator_t(func):
-        if len(callees) >= 5: break
-        for xref_ea in idautils.CodeRefsFrom(ea, 0):
-            callee_func = idaapi.get_func(xref_ea)
-            if callee_func and callee_func.start_ea != func.start_ea:
-                callee_name = callee_func.get_name() if hasattr(callee_func, 'get_name') else ida_funcs.get_func_name(callee_func.start_ea)
-                callees.add(f"{callee_name}@{hex(callee_func.start_ea)}")
-
-    output.append(f"Callees: {', '.join(callees) if callees else 'None'}")
-
-    # Globals (limit 5)
-    globals_found = set()
-    for ea in ida_funcs.func_item_iterator_t(func):
-        if len(globals_found) >= 5: break
+        if max_globals > 0 and len(globals_found) >= max_globals:
+            break
         for dref_ea in idautils.DataRefsFrom(ea):
-            if not idaapi.get_func(dref_ea):
-                name = ida_name.get_name(dref_ea)
-                if name:
-                    globals_found.add(f"{name}@{hex(dref_ea)}")
+            if dref_ea in seen_globals:
+                continue
+            if idaapi.get_func(dref_ea):
+                continue
+            name = ida_name.get_name(dref_ea)
+            seen_globals.add(dref_ea)
+            entry = {"address": hex(dref_ea)}
+            if name:
+                entry["name"] = name
+            globals_found.append(entry)
+            if max_globals > 0 and len(globals_found) >= max_globals:
+                break
 
-    output.append(f"Globals: {', '.join(globals_found) if globals_found else 'None'}")
+    pseudocode_lines: list[str] = []
+    decompilation_error: Optional[str] = None
+    if "decompilation" in selected_sections or output_kind == "json":
+        try:
+            cfunc = decompile_checked(addr)
+            if is_window_active():
+                ida_hexrays.open_pseudocode(addr, ida_hexrays.OPF_REUSE)
+            sv = cfunc.get_pseudocode()
+            for sl in sv:
+                line = ida_lines.tag_remove(sl.line)
+                pseudocode_lines.append(line)
+        except Exception as exc:  # noqa: BLE001
+            decompilation_error = str(exc)
 
-    # Decompiled code (compact)
-    output.append("DECOMPILED:")
+    assembly_lines: list[str] = []
+    if "assembly" in selected_sections or output_kind == "json":
+        for ea in ida_funcs.func_item_iterator_t(func):
+            disasm = ida_lines.tag_remove(idaapi.generate_disasm_line(ea, 0))
+            comment = idaapi.get_cmt(ea, False) or idaapi.get_cmt(ea, True)
+            line = f"{hex(ea)}: {disasm}"
+            if comment:
+                line += f" ;{comment}"
+            assembly_lines.append(line)
+
+    xrefs: list[dict] = []
+    if (include_xrefs or "xrefs" in selected_sections) and max_xrefs != 0:
+        for xref in idautils.XrefsTo(func.start_ea):
+            entry: dict[str, Any] = {
+                "address": hex(xref.frm),
+                "type": ida_xref.get_xref_type_name(xref.type),
+            }
+            caller_func = idaapi.get_func(xref.frm)
+            if caller_func:
+                entry["function"] = get_function(caller_func.start_ea)
+            xrefs.append(entry)
+            if len(xrefs) >= max_xrefs > 0:
+                break
+
+    if output_kind == "json":
+        result: dict[str, Any] = {
+            "function": function_info,
+            "metadata": {
+                "size_bytes": func_size,
+                "start_ea": function_info["address"],
+            },
+            "links": _build_function_links(func.start_ea),
+        }
+        if "callers" in selected_sections:
+            result["callers"] = callers
+        if "callees" in selected_sections:
+            result["callees"] = callees
+        if "globals" in selected_sections:
+            result["globals"] = globals_found
+        if "xrefs" in selected_sections and xrefs:
+            result["xrefs"] = xrefs
+        if "decompilation" in selected_sections:
+            if decompilation_error:
+                result["decompilation_error"] = decompilation_error
+            else:
+                result["decompilation"] = pseudocode_lines
+        if "assembly" in selected_sections:
+            result["assembly"] = assembly_lines
+        if "summary" in selected_sections:
+            result["summary"] = {
+                "label": func_name,
+                "size_bytes": func_size,
+                "address": function_info["address"],
+            }
+        return result
+
+    lines: list[str] = []
+    if output_kind == "markdown":
+        if "summary" in selected_sections:
+            lines.append(f"### {func_name} @ {function_info['address']}")
+            lines.append(f"- Size: {func_size} bytes")
+    else:
+        if "summary" in selected_sections:
+            lines.append(f"=== {func_name} @ {function_info['address']} | Size: {func_size}b ===")
+
+    if "callers" in selected_sections:
+        if output_kind == "markdown":
+            lines.append("**Callers:**")
+            if callers:
+                for item in callers:
+                    lines.append(f"- {item['name']} ({item['address']})")
+            else:
+                lines.append("- None")
+        else:
+            caller_text = ", ".join(f"{item['name']}@{item['address']}" for item in callers) if callers else "None"
+            lines.append(f"Callers: {caller_text}")
+
+    if "callees" in selected_sections:
+        if output_kind == "markdown":
+            lines.append("**Callees:**")
+            if callees:
+                for item in callees:
+                    lines.append(f"- {item['name']} ({item['address']})")
+            else:
+                lines.append("- None")
+        else:
+            callee_text = ", ".join(f"{item['name']}@{item['address']}" for item in callees) if callees else "None"
+            lines.append(f"Callees: {callee_text}")
+
+    if "globals" in selected_sections:
+        if output_kind == "markdown":
+            lines.append("**Global references:**")
+            if globals_found:
+                for item in globals_found:
+                    label = item.get("name", "<anonymous>")
+                    lines.append(f"- {label} ({item['address']})")
+            else:
+                lines.append("- None")
+        else:
+            if globals_found:
+                formatted = ", ".join(
+                    f"{item.get('name', '<anonymous>')}@{item['address']}" for item in globals_found
+                )
+            else:
+                formatted = "None"
+            lines.append(f"Globals: {formatted}")
+
+    if "xrefs" in selected_sections and xrefs:
+        if output_kind == "markdown":
+            lines.append("**Cross-references:**")
+            for entry in xrefs:
+                func_entry = entry.get("function")
+                if func_entry:
+                    lines.append(
+                        f"- {entry['type']} from {func_entry['name']} ({func_entry['address']})"
+                    )
+                else:
+                    lines.append(f"- {entry['type']} from {entry['address']}")
+        else:
+            formatted = []
+            for entry in xrefs:
+                if entry.get("function"):
+                    formatted.append(
+                        f"{entry['function']['name']}@{entry['function']['address']} ({entry['type']})"
+                    )
+                else:
+                    formatted.append(f"{entry['address']} ({entry['type']})")
+            if formatted:
+                lines.append(f"Xrefs: {', '.join(formatted)}")
+
+    if "decompilation" in selected_sections:
+        if output_kind == "markdown":
+            lines.append("**Pseudocode:**")
+            if decompilation_error:
+                lines.append(f"> Decompilation failed: {decompilation_error}")
+            else:
+                lines.append("```c")
+                lines.extend(pseudocode_lines)
+                lines.append("```")
+        else:
+            lines.append("DECOMPILED:")
+            if decompilation_error:
+                lines.append(f"Decompilation failed: {decompilation_error}")
+            else:
+                lines.extend(pseudocode_lines)
+
+    if "assembly" in selected_sections:
+        if output_kind == "markdown":
+            lines.append("**Assembly:**")
+            lines.append("```asm")
+            lines.extend(assembly_lines)
+            lines.append("```")
+        else:
+            lines.append("ASSEMBLY:")
+            lines.extend(assembly_lines)
+
+    return "\n".join(lines)
+
+
+@jsonrpc
+@idaread
+def analyze_call_graph(
+    address: Annotated[str, "Address of the root function"],
+    max_depth: Annotated[int, "Maximum traversal depth from the root (0 for root only)"] = 1,
+    direction: Annotated[str, "Traversal direction: forward, backward, or both"] = "both",
+    include_external: Annotated[bool, "Include call edges without a defined function"] = False,
+    max_functions: Annotated[int, "Maximum number of functions to explore (0 for unlimited)"] = 128,
+) -> FunctionGraph:
+    """Generate a call graph rooted at the specified function."""
+
+    root_ea = parse_address(address)
+    root_func = idaapi.get_func(root_ea)
+    if not root_func:
+        raise IDAError(f"No function found at address {address}")
+
+    if max_depth < 0:
+        raise IDAError("max_depth must be zero or greater")
+    if max_functions < 0:
+        raise IDAError("max_functions must be zero or greater")
+
+    traversal = direction.lower().strip() or "both"
+    if traversal not in {"forward", "backward", "both"}:
+        raise IDAError("direction must be 'forward', 'backward', or 'both'")
+
+    node_limit: Optional[int]
+    node_limit = max_functions if max_functions > 0 else None
+
+    visited: dict[int, FunctionGraphNode] = {}
+    queue: deque[tuple[int, int]] = deque([(root_func.start_ea, 0)])
+    enqueued: set[int] = {root_func.start_ea}
+
+    while queue:
+        current_ea, depth = queue.popleft()
+        enqueued.discard(current_ea)
+        if current_ea in visited:
+            continue
+
+        current_func = idaapi.get_func(current_ea)
+        if not current_func:
+            if include_external:
+                placeholder = Function(address=hex(current_ea), name=f"<external {hex(current_ea)}>", size="0x0")
+                visited[current_ea] = FunctionGraphNode(
+                    function=placeholder,
+                    callers=[],
+                    callees=[],
+                    depth=depth,
+                )
+            continue
+
+        node = FunctionGraphNode(
+            function=get_function(current_func.start_ea),
+            callers=[],
+            callees=[],
+            depth=depth,
+        )
+        prototype = get_prototype(current_func)
+        if prototype:
+            node["prototype"] = prototype
+        node["links"] = _build_function_links(current_func.start_ea)
+        visited[current_func.start_ea] = node
+
+        if node_limit is not None and len(visited) >= node_limit:
+            continue
+
+        explore_forward = traversal in {"forward", "both"}
+        explore_backward = traversal in {"backward", "both"}
+
+        if explore_backward:
+            callers_seen: set[int] = set()
+            for xref_ea in idautils.CodeRefsTo(current_func.start_ea, 0):
+                caller_func = idaapi.get_func(xref_ea)
+                if caller_func:
+                    if caller_func.start_ea not in callers_seen:
+                        callers_seen.add(caller_func.start_ea)
+                        node["callers"].append(get_function(caller_func.start_ea))
+                    if depth < max_depth and (
+                        node_limit is None or len(visited) + len(enqueued) < node_limit
+                    ) and caller_func.start_ea not in visited and caller_func.start_ea not in enqueued:
+                        queue.append((caller_func.start_ea, depth + 1))
+                        enqueued.add(caller_func.start_ea)
+                elif include_external:
+                    node["callers"].append(
+                        Function(address=hex(xref_ea), name=f"<external {hex(xref_ea)}>", size="0x0")
+                    )
+
+        if explore_forward:
+            callees_seen: set[int] = set()
+            for item_ea in ida_funcs.func_item_iterator_t(current_func):
+                for xref_ea in idautils.CodeRefsFrom(item_ea, 0):
+                    callee_func = idaapi.get_func(xref_ea)
+                    if callee_func:
+                        if callee_func.start_ea == current_func.start_ea:
+                            continue
+                        if callee_func.start_ea not in callees_seen:
+                            callees_seen.add(callee_func.start_ea)
+                            node["callees"].append(get_function(callee_func.start_ea))
+                        if depth < max_depth and (
+                            node_limit is None or len(visited) + len(enqueued) < node_limit
+                        ) and callee_func.start_ea not in visited and callee_func.start_ea not in enqueued:
+                            queue.append((callee_func.start_ea, depth + 1))
+                            enqueued.add(callee_func.start_ea)
+                    elif include_external:
+                        node["callees"].append(
+                            Function(address=hex(xref_ea), name=f"<external {hex(xref_ea)}>", size="0x0")
+                        )
+
+    ordered_nodes = [visited[key] for key in visited]
+    function_info = get_function(root_func.start_ea)
+    return FunctionGraph(
+        root=function_info,
+        direction=traversal,
+        max_depth=max_depth,
+        total_nodes=len(ordered_nodes),
+        nodes=ordered_nodes,
+        links=[
+            Link(rel="self", method="analyze_call_graph", params={
+                 "address": function_info["address"],
+                 "max_depth": max_depth,
+                 "direction": traversal,
+                 "include_external": include_external,
+                 "max_functions": max_functions,
+            }),
+            Link(rel="decompile", method="decompile_function", params={"address": function_info["address"]}),
+            Link(rel="data-flow", method="analyze_data_flow", params={"address": function_info["address"]}),
+        ],
+    )
+
+
+@jsonrpc
+@idaread
+def analyze_data_flow(
+    address: Annotated[str, "Address of the function to analyze"],
+    variable_filter: Annotated[str, "Case-insensitive filter for variable names"] = "",
+    include_globals: Annotated[bool, "Include referenced global data"] = True,
+    include_locals: Annotated[bool, "Include local stack variables"] = True,
+    include_arguments: Annotated[bool, "Include function arguments"] = True,
+    max_references: Annotated[int, "Maximum references per variable (0 for unlimited)"] = 40,
+    max_data_references: Annotated[int, "Maximum data references to record (0 for unlimited)"] = 128,
+) -> DataFlowSummary:
+    """Summarize variable usage, data references, and call sites for a function."""
+
+    ea = parse_address(address)
+    func = idaapi.get_func(ea)
+    if not func:
+        raise IDAError(f"No function found at address {address}")
+
+    if max_references < 0:
+        raise IDAError("max_references must be zero or greater")
+    if max_data_references < 0:
+        raise IDAError("max_data_references must be zero or greater")
+
+    filter_text = variable_filter.lower().strip()
+    variables: dict[str, DataFlowVariable] = {}
+    pseudocode_lines: list[str] = []
+    decompiler_error: Optional[str] = None
+    cfunc: Optional[ida_hexrays.cfunc_t] = None
+
     try:
-        cfunc = decompile_checked(addr)
-        if is_window_active():
-            ida_hexrays.open_pseudocode(addr, ida_hexrays.OPF_REUSE)
-        sv = cfunc.get_pseudocode()
-        for i, sl in enumerate(sv):
-            line = ida_lines.tag_remove(sl.line)
-            output.append(line)
-    except Exception as e:
-        output.append(f"Decompilation failed: {e}")
+        cfunc = decompile_checked(func.start_ea)
+    except (DecompilerLicenseError, IDAError) as exc:
+        decompiler_error = str(exc)
+    else:
+        for sl in cfunc.get_pseudocode():
+            pseudocode_lines.append(ida_lines.tag_remove(sl.line))
 
-    # Assembly code (compact)
-    output.append("ASSEMBLY:")
-    for ea in ida_funcs.func_item_iterator_t(func):
-        disasm = ida_lines.tag_remove(idaapi.generate_disasm_line(ea, 0))
-        comment = idaapi.get_cmt(ea, False) or idaapi.get_cmt(ea, True)
-        line = f"{hex(ea)}: {disasm}"
-        if comment: line += f" ;{comment}"
-        output.append(line)
+    if cfunc and (include_locals or include_arguments):
+        for lvar in cfunc.get_lvars():
+            storage = "argument" if getattr(lvar, "is_arg_var", False) else "local"
+            if storage == "argument" and not include_arguments:
+                continue
+            if storage == "local" and not include_locals:
+                continue
 
-    return "\n".join(output)
+            base_name = getattr(lvar, "name", "") or f"var_{len(variables)}"
+            name = base_name
+            suffix = 1
+            while name in variables:
+                name = f"{base_name}_{suffix}"
+                suffix += 1
+
+            var_entry: DataFlowVariable = DataFlowVariable(name=name, storage=storage, references=[])
+            try:
+                var_type = str(lvar.type())
+            except Exception:
+                var_type = None
+            if var_type:
+                var_entry["type"] = var_type
+            variables[name] = var_entry
+
+    if not pseudocode_lines:
+        for idx, item_ea in enumerate(ida_funcs.func_item_iterator_t(func)):
+            if idx >= 64:
+                break
+            disasm = ida_lines.tag_remove(idaapi.generate_disasm_line(item_ea, 0))
+            pseudocode_lines.append(f"{hex(item_ea)}: {disasm}")
+
+    if pseudocode_lines:
+        for line_idx, line in enumerate(pseudocode_lines, start=1):
+            for name, entry in variables.items():
+                if filter_text and filter_text not in name.lower():
+                    continue
+                if not _identifier_in_line(line, name):
+                    continue
+                refs = entry["references"]
+                if max_references > 0 and len(refs) >= max_references:
+                    continue
+                refs.append(
+                    DataFlowReference(
+                        kind="usage",
+                        line=line_idx,
+                        text=line.strip(),
+                        name=name,
+                    )
+                )
+
+    data_refs: list[DataFlowReference] = []
+    if include_globals:
+        seen_refs: set[tuple[int, int, int]] = set()
+        for item_ea in ida_funcs.func_item_iterator_t(func):
+            for xref in idautils.XrefsFrom(item_ea):
+                if xref.iscode:
+                    continue
+                key = (item_ea, xref.to, xref.type)
+                if key in seen_refs:
+                    continue
+                seen_refs.add(key)
+                ref_entry: DataFlowReference = DataFlowReference(
+                    kind=ida_xref.get_xref_type_name(xref.type),
+                    address=hex(item_ea),
+                    target=hex(xref.to),
+                )
+                name = ida_name.get_name(xref.to)
+                if name:
+                    ref_entry["name"] = name
+                data_refs.append(ref_entry)
+                if max_data_references > 0 and len(data_refs) >= max_data_references:
+                    break
+            if max_data_references > 0 and len(data_refs) >= max_data_references:
+                break
+
+    call_sites: list[DataFlowReference] = []
+    seen_calls: set[tuple[int, int]] = set()
+    for item_ea in ida_funcs.func_item_iterator_t(func):
+        for cref in idautils.CodeRefsFrom(item_ea, 0):
+            key = (item_ea, cref)
+            if key in seen_calls:
+                continue
+            seen_calls.add(key)
+            entry = DataFlowReference(kind="call", address=hex(item_ea), target=hex(cref))
+            callee_func = idaapi.get_func(cref)
+            if callee_func:
+                entry["function"] = get_function(callee_func.start_ea)
+            call_sites.append(entry)
+
+    locals_list: list[DataFlowVariable] = []
+    arguments_list: list[DataFlowVariable] = []
+    for entry in variables.values():
+        if filter_text and filter_text not in entry["name"].lower():
+            continue
+        if max_references > 0 and len(entry["references"]) > max_references:
+            entry["references"] = entry["references"][:max_references]
+        if entry["storage"] == "argument":
+            arguments_list.append(entry)
+        else:
+            locals_list.append(entry)
+
+    result: DataFlowSummary = DataFlowSummary(
+        function=get_function(func.start_ea),
+        locals=locals_list if include_locals else [],
+        arguments=arguments_list if include_arguments else [],
+        globals=data_refs if include_globals else [],
+        call_sites=call_sites,
+        pseudocode=pseudocode_lines,
+        links=[
+            Link(rel="self", method="analyze_data_flow", params={
+                 "address": hex(func.start_ea),
+                 "variable_filter": variable_filter,
+                 "include_globals": include_globals,
+                 "include_locals": include_locals,
+                 "include_arguments": include_arguments,
+                 "max_references": max_references,
+                 "max_data_references": max_data_references,
+            }),
+            Link(rel="decompile", method="decompile_function", params={"address": hex(func.start_ea)}),
+            Link(rel="call-graph", method="analyze_call_graph", params={"address": hex(func.start_ea)}),
+        ],
+    )
+    if decompiler_error:
+        result["notes"] = {"decompiler_error": decompiler_error}
+    return result
+
+
+@jsonrpc
+@idaread
+def map_program_structures(
+    limit: Annotated[int, "Maximum number of entries per category (0 for unlimited)"] = 50,
+    include_segments: Annotated[bool, "Include memory segments in the result"] = True,
+    include_structures: Annotated[bool, "Include structure summaries"] = True,
+    include_enums: Annotated[bool, "Include enumeration summaries"] = True,
+    include_functions: Annotated[bool, "Include sample function relationships"] = True,
+) -> ProgramStructureMap:
+    """Map program structures, types, and high-level relationships."""
+
+    if limit < 0:
+        raise IDAError("limit must be zero or greater")
+
+    limit_value: Optional[int] = limit if limit > 0 else None
+
+    structure_count = 0
+    structures_sample: list[dict] = []
+    if include_structures:
+        for ordinal in range(1, ida_typeinf.get_ordinal_limit()):
+            tif = ida_typeinf.tinfo_t()
+            if not tif.get_numbered_type(None, ordinal):
+                continue
+            if not tif.is_udt():
+                continue
+            structure_count += 1
+            collect = limit_value is None or len(structures_sample) < limit_value
+            if collect:
+                udt = ida_typeinf.udt_type_data_t()
+                member_count = 0
+                if tif.get_udt_details(udt):
+                    member_count = sum(1 for m in udt if not m.is_gap())
+                name = tif.get_type_name() or f"<anonymous_{ordinal}>"
+                structures_sample.append(
+                    {
+                        "name": name,
+                        "size": tif.get_size(),
+                        "member_count": member_count,
+                    }
+                )
+            if limit_value is not None and len(structures_sample) >= limit_value and structure_count >= limit_value:
+                continue
+        if structure_count == 0:
+            structure_count = len(structures_sample)
+    else:
+        for ordinal in range(1, ida_typeinf.get_ordinal_limit()):
+            tif = ida_typeinf.tinfo_t()
+            if tif.get_numbered_type(None, ordinal) and tif.is_udt():
+                structure_count += 1
+
+    enum_count = 0
+    enums_sample: list[dict] = []
+    if include_enums and IDA_ENUM_AVAILABLE:
+        # IDA 8.x style enum iteration
+        enum_count = ida_enum.get_enum_qty()
+        for idx in range(enum_count):
+            enum_id = ida_enum.getn_enum(idx)
+            if enum_id == idaapi.BADNODE:
+                continue
+            name = ida_enum.get_enum_name(enum_id) or f"<enum_{idx}>"
+            enum_info = {
+                "name": name,
+                "size": ida_enum.get_enum_size(enum_id),
+            }
+            member_qty = None
+            if hasattr(ida_enum, "get_enum_member_qty"):
+                try:
+                    member_qty = ida_enum.get_enum_member_qty(enum_id)
+                except Exception:
+                    member_qty = None
+            if member_qty is not None:
+                enum_info["member_count"] = member_qty
+            enums_sample.append(enum_info)
+            if limit_value is not None and len(enums_sample) >= limit_value:
+                break
+    elif include_enums:
+        # IDA 9.x style enum iteration using type system
+        try:
+            # Iterate through all named types to find enums
+            for ordinal in range(1, ida_typeinf.get_ordinal_limit()):
+                tif = ida_typeinf.tinfo_t()
+                if tif.get_numbered_type(None, ordinal) and tif.is_enum():
+                    enum_count += 1
+                    if limit_value is not None and len(enums_sample) >= limit_value:
+                        continue
+                    name = tif.get_type_name() or f"<enum_{ordinal}>"
+                    # Get enum member count using IDA 9.x API
+                    try:
+                        member_count = tif.get_enum_nmembers()
+                    except Exception:
+                        member_count = 0
+                    enum_info = {
+                        "name": name,
+                        "size": member_count,
+                    }
+                    enums_sample.append(enum_info)
+        except Exception as e:
+            # If type system iteration fails, skip enums
+            pass
+
+    segments: list[dict] = []
+    if include_segments:
+        perm_map = [
+            (ida_segment.SEGPERM_READ, "R"),
+            (ida_segment.SEGPERM_WRITE, "W"),
+            (ida_segment.SEGPERM_EXEC, "X"),
+        ]
+        seg_limit = limit_value
+        for idx in range(idaapi.get_segm_qty()):
+            seg = idaapi.getnseg(idx)
+            if not seg:
+                continue
+            perms = "".join(flag for perm, flag in perm_map if seg.perm & perm) or "-"
+            segments.append(
+                {
+                    "name": idaapi.get_segm_name(seg) or f"seg_{idx}",
+                    "start": hex(seg.start_ea),
+                    "end": hex(seg.end_ea),
+                    "size": seg.end_ea - seg.start_ea,
+                    "perms": perms,
+                }
+            )
+            if seg_limit is not None and len(segments) >= seg_limit:
+                break
+
+    functions_sample: list[dict] = []
+    if include_functions:
+        func_limit = limit_value
+        for fn_ea in idautils.Functions():
+            if func_limit is not None and len(functions_sample) >= func_limit:
+                break
+            fn = idaapi.get_func(fn_ea)
+            if not fn:
+                continue
+            info = dict(get_function(fn.start_ea))
+            info["callers"] = len(_collect_callers(fn, None))
+            info["callees"] = len(_collect_callees(fn, None))
+            prototype = get_prototype(fn)
+            if prototype:
+                info["prototype"] = prototype
+            info["links"] = _build_function_links(fn.start_ea)
+            functions_sample.append(info)
+
+    summary = {
+        "functions": ida_funcs.get_func_qty(),
+        "segments": idaapi.get_segm_qty(),
+        "structures": structure_count,
+        "enums": enum_count,
+    }
+
+    result: ProgramStructureMap = ProgramStructureMap(summary=summary)
+    if include_segments:
+        result["segments"] = segments
+    if include_structures:
+        result["structures"] = structures_sample
+    if include_enums:
+        result["enums"] = enums_sample
+    if include_functions:
+        result["functions"] = functions_sample
+
+    result["links"] = [
+        Link(rel="self", method="map_program_structures", params={
+             "limit": limit,
+             "include_segments": include_segments,
+             "include_structures": include_structures,
+             "include_enums": include_enums,
+             "include_functions": include_functions,
+        }),
+        Link(rel="discover", method="discover_resources", params={"context": "root"}),
+        Link(rel="structures-detailed", method="get_defined_structures", params={}),
+    ]
+    return result
+
 
 class DisassemblyLine(TypedDict):
     segment: NotRequired[str]
@@ -2036,10 +2822,39 @@ def read_memory_bytes(
     """
     return ' '.join(f'{x:#02x}' for x in ida_bytes.get_bytes(parse_address(memory_address), size))
 
+
+@jsonrpc
+@idawrite
+def write_memory_bytes(
+        address: Annotated[str, "Address where bytes should be patched"],
+        data: Annotated[str, "Hex-encoded byte string (spaces and newlines ignored)"]
+) -> str:
+    """Patch raw bytes at the specified address."""
+
+    ea = parse_address(address)
+    cleaned = "".join(ch for ch in data.split())
+    if len(cleaned) == 0:
+        raise IDAError("No data provided to write")
+    if len(cleaned) % 2 != 0:
+        raise IDAError("Hex data must contain an even number of characters")
+
+    try:
+        payload = bytes.fromhex(cleaned)
+    except ValueError:
+        raise IDAError("Data must be a valid hex string")
+
+    ida_bytes.patch_bytes(ea, payload)
+
+    func = idaapi.get_func(ea)
+    if func:
+        refresh_decompiler_ctext(func.start_ea)
+
+    return f"Wrote {len(payload)} bytes to {hex(ea)}"
+
 @jsonrpc
 @idaread
 def data_read_byte(
-    address: Annotated[str, "Address to get 1 byte value from"],
+        address: Annotated[str, "Address to get 1 byte value from"],
 ) -> int:
     """
     Read the 1 byte value at the specified address.
@@ -2287,6 +3102,108 @@ def manage_breakpoint(
 
     else:
         raise IDAError(f"Invalid action '{action}'. Must be 'set', 'delete', or 'toggle'.")
+
+
+@jsonrpc
+@idaread
+def discover_resources(
+    context: Annotated[str, "Optional navigation context such as 'function:0x401000'"] = "",
+) -> dict:
+    """Expose discoverable links to MCP functionality (HATEOAS-style navigation)."""
+
+    ctx = context.strip()
+    result: dict[str, Any] = {
+        "context": ctx or "root",
+        "counts": {
+            "available_methods": len(rpc_registry.methods),
+            "unsafe_methods": len(rpc_registry.unsafe),
+        },
+    }
+
+    links: list[Link] = [Link(rel="self", method="discover_resources", params={"context": ctx})]
+
+    base_links: list[Link] = [
+        Link(
+            rel="functions",
+            method="list_functions",
+            description="List functions (provide offset/count)",
+            params={"offset": 0, "count": 100},
+        ),
+        Link(
+            rel="globals",
+            method="list_globals",
+            description="List globals (provide offset/count)",
+            params={"offset": 0, "count": 100, "filter": ""},
+        ),
+        Link(
+            rel="strings",
+            method="list_strings",
+            description="List strings (provide offset/count)",
+            params={"offset": 0, "count": 100, "filter": ""},
+        ),
+        Link(
+            rel="structures",
+            method="map_program_structures",
+            description="Summarize program structures and relationships",
+            params={"limit": 50},
+        ),
+        Link(
+            rel="decompile",
+            method="decompile_function",
+            description="Decompile a function (provide an address)",
+            params={"address": "<function_address>"},
+        ),
+        Link(
+            rel="call-graph",
+            method="analyze_call_graph",
+            description="Generate a call graph (provide an address)",
+            params={"address": "<function_address>"},
+        ),
+        Link(
+            rel="data-flow",
+            method="analyze_data_flow",
+            description="Analyze data flow (provide an address)",
+            params={"address": "<function_address>"},
+        ),
+        Link(
+            rel="memory-read",
+            method="read_memory_bytes",
+            description="Read raw memory bytes",
+            params={"memory_address": "<address>", "size": 16},
+        ),
+        Link(
+            rel="memory-write",
+            method="write_memory_bytes",
+            description="Patch raw bytes at an address",
+            params={"address": "<address>", "data": "<hex_bytes>"},
+        ),
+        Link(
+            rel="batch",
+            method="batch_tool_calls",
+            description="Execute multiple MCP tools in a single request",
+            params={"requests": []},
+        ),
+    ]
+
+    if not ctx or ctx.lower() == "root":
+        links.extend(base_links)
+    elif ctx.lower().startswith("function:"):
+        addr_text = ctx.split(":", 1)[1]
+        try:
+            fn_ea = parse_address(addr_text)
+            fn = idaapi.get_func(fn_ea)
+            if not fn:
+                raise IDAError("invalid function context")
+        except Exception as exc:  # noqa: BLE001
+            result["warning"] = f"Unable to resolve context '{context}': {exc}"
+        else:
+            result["function"] = get_function(fn.start_ea)
+            links.extend(_build_function_links(fn.start_ea))
+    else:
+        result["warning"] = f"Unknown context '{context}'"
+
+    result["links"] = links
+    return result
 
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
