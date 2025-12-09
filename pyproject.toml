@@ -16,6 +16,10 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=1.6.0",
+    "idapro>=0.0.7",
+    "typing-inspection>=0.4.0",
+    "ida-domain>=0.1.0",
+    "pillow>=12.0.0",
 ]
 
 [project.urls]
@@ -34,3 +38,4 @@ dev = [
 [project.scripts]
 ida-pro-mcp = "ida_pro_mcp.server:main"
 idalib-mcp = "ida_pro_mcp.idalib_server:main"
+ida-domain-mcp = "ida_pro_mcp.ida_domain_server:main"

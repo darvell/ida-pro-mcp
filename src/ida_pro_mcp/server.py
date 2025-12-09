@@ -1,34 +1,56 @@
+# IDA Pro MCP Server - Simplified 12-tool design for LLM reverse engineering
+# This server exposes IDA Pro tools via MCP (Model Context Protocol)
+
 import os
 import sys
-import ast
 import json
-import shutil
-import argparse
-import http.client
 import socket
+import http.client
 import errno
-from contextlib import suppress
+import argparse
+import shutil
+import signal
+import subprocess
+import time
 from pathlib import Path
-from typing import Annotated, Any, Callable, Dict, List, Optional, TypedDict
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional
+from contextlib import suppress
 from glob import glob
+from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-# The log_level is necessary for Cline to work: https://github.com/jlowin/fastmcp/issues/81
+# ============================================================================
+# Configuration
+# ============================================================================
+
 mcp = FastMCP("ida-pro-mcp", log_level="ERROR")
 
-BATCH_TOOL_NAME = "batch_tool_calls"
-
-jsonrpc_request_id = 1
+DEFAULT_TIMEOUT = float(os.environ.get("IDA_MCP_REQUEST_TIMEOUT", "15"))
+METHOD_TIMEOUTS = {
+    "decompile": 30.0,
+    "disassemble": 25.0,
+    "list_functions": 20.0,
+    "search_strings": 30.0,
+    "search": 30.0,
+    "get_xrefs": 20.0,
+    "script_exec": 60.0,
+}
 
 INSTANCE_RUNTIME_ENV = "IDA_PRO_MCP_RUNTIME_DIR"
 _runtime_root = os.environ.get(INSTANCE_RUNTIME_ENV)
 if _runtime_root:
-    INSTANCE_REGISTRY_DIR = Path(_runtime_root) / "instances"
+    INSTANCE_REGISTRY_DIR = Path(os.path.expanduser(_runtime_root))
 else:
-    INSTANCE_REGISTRY_DIR = Path.home() / ".ida-pro-mcp" / "instances"
+    INSTANCE_REGISTRY_DIR = Path.home() / ".ida-pro-mcp"
 
+# Also check the 'instances' subdirectory for backwards compatibility
+INSTANCE_REGISTRY_DIRS = [INSTANCE_REGISTRY_DIR, INSTANCE_REGISTRY_DIR / "instances"]
+
+
+# ============================================================================
+# Unix Socket Communication
+# ============================================================================
 
 class UnixHTTPConnection(http.client.HTTPConnection):
     def __init__(self, path: str, timeout: float = 10):
@@ -43,22 +65,28 @@ class UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = sock
 
 
-def _send_jsonrpc_request(socket_path: str, method: str, params: List[Any]) -> Any:
-    global jsonrpc_request_id
+_jsonrpc_request_id = 1
 
-    conn = UnixHTTPConnection(socket_path, timeout=10)
+# Track timeouts to avoid killing long-running but healthy instances too aggressively
+_timeout_marks: Dict[str, float] = {}
+KILL_GRACE_SECONDS = float(os.environ.get("IDA_MCP_KILL_GRACE", "120"))
+
+
+def _send_jsonrpc_request(socket_path: str, method: str, params: Any, timeout: float) -> Any:
+    """Send JSON-RPC request to IDA plugin."""
+    global _jsonrpc_request_id
+    conn = UnixHTTPConnection(socket_path, timeout=timeout)
+
     request = {
         "jsonrpc": "2.0",
         "method": method,
-        "params": params,
-        "id": jsonrpc_request_id,
+        "params": params if params is not None else {},
+        "id": _jsonrpc_request_id,
     }
-    jsonrpc_request_id += 1
+    _jsonrpc_request_id += 1
 
     try:
-        conn.request("POST", "/mcp", json.dumps(request), {
-            "Content-Type": "application/json"
-        })
+        conn.request("POST", "/mcp", json.dumps(request), {"Content-Type": "application/json"})
         response = conn.getresponse()
         payload = response.read().decode()
         data = json.loads(payload)
@@ -67,589 +95,822 @@ def _send_jsonrpc_request(socket_path: str, method: str, params: List[Any]) -> A
 
     if "error" in data:
         error = data["error"]
-        code = error.get("code")
         message = error.get("message", "unknown error")
-        pretty = f"JSON-RPC error {code}: {message}"
-        if "data" in error:
-            pretty += "\n" + str(error["data"])
-        raise Exception(pretty)
+        raise Exception(message)
 
-    result = data.get("result")
-    if result is None:
-        result = "success"
-    return result
+    return data.get("result", "success")
+
+
+# ============================================================================
+# Instance Management
+# ============================================================================
+
+class InstanceLookupError(LookupError):
+    pass
 
 
 class InstanceManager:
+    """Manages connections to IDA Pro instances."""
     _instances: Dict[str, Dict[str, Any]] = {}
     _loaded: bool = False
 
     @staticmethod
     def _probe_socket(path: Path) -> Optional[Dict[str, Any]]:
-        try:
-            metadata = _send_jsonrpc_request(str(path), "describe_instance", [])
-        except FileNotFoundError:
-            with suppress(FileNotFoundError):
-                path.unlink()
-            return None
-        except OSError as e:
-            if e.errno in (errno.ENOENT, errno.ECONNREFUSED):
-                with suppress(FileNotFoundError):
-                    path.unlink()
-            return None
-        except Exception:
-            return None
-
-        if not isinstance(metadata, dict):
-            return None
-
-        database = metadata.get("database")
-        if not isinstance(database, str) or not database:
-            return None
-
-        metadata = dict(metadata)
-        metadata["_socket"] = str(path)
-        return metadata
+        """Try to connect to a socket and get instance info."""
+        for method in ("system.info", "info", "discover"):
+            try:
+                meta = _send_jsonrpc_request(str(path), method, {}, DEFAULT_TIMEOUT)
+                if isinstance(meta, dict):
+                    rec = dict(meta)
+                    rec["_socket"] = str(path)
+                    rec.setdefault("status", "ready")
+                    if not rec.get("database"):
+                        stem = path.stem
+                        if "_" in stem:
+                            rec["database"] = stem.split("_", 1)[1] or stem
+                        else:
+                            rec["database"] = stem
+                    return rec
+            except Exception as e:
+                if isinstance(e, OSError) and e.errno in (errno.ENOENT, errno.ECONNREFUSED):
+                    with suppress(Exception):
+                        path.unlink()
+                continue
+        return None
 
     @classmethod
     def refresh(cls) -> None:
+        """Scan for active IDA instances."""
         cls._instances = {}
         cls._loaded = True
-        if not INSTANCE_REGISTRY_DIR.exists():
-            return
-
-        for socket_path in INSTANCE_REGISTRY_DIR.glob("*.sock"):
-            record = cls._probe_socket(socket_path)
-            if record is None:
+        for registry_dir in INSTANCE_REGISTRY_DIRS:
+            if not registry_dir.exists():
                 continue
-            cls._instances[record["database"]] = record
-
-    @classmethod
-    def _ensure_loaded(cls) -> None:
-        if not cls._loaded:
-            cls.refresh()
+            for socket_path in registry_dir.glob("*.sock"):
+                record = cls._probe_socket(socket_path)
+                if record:
+                    key = record.get("database", socket_path.stem)
+                    cls._instances[key] = record
 
     @classmethod
     def list(cls) -> List[Dict[str, Any]]:
+        """List all active instances."""
         cls.refresh()
-        records = list(cls._instances.values())
-        records.sort(key=lambda item: item.get("loaded_at", ""))
-        return records
+        return list(cls._instances.values())
+
+    @classmethod
+    def resolve(cls, database: str) -> str:
+        """Resolve database name to instance key."""
+        if not cls._loaded:
+            cls.refresh()
+
+        # Exact match
+        if database in cls._instances:
+            return database
+
+        # Case-insensitive match
+        lower_query = database.lower()
+        for name in cls._instances:
+            if name.lower() == lower_query:
+                return name
+
+        # Prefix match
+        for name in cls._instances:
+            if name.lower().startswith(lower_query):
+                return name
+
+        # Refresh and try again
+        cls.refresh()
+        if database in cls._instances:
+            return database
+        for name in cls._instances:
+            if name.lower() == lower_query or name.lower().startswith(lower_query):
+                return name
+
+        raise InstanceLookupError(
+            f"No IDA instance found for '{database}'. Use list_instances to see active sessions."
+        )
 
     @classmethod
     def get(cls, database: str) -> Dict[str, Any]:
-        cls._ensure_loaded()
-        record = cls._instances.get(database)
-        if record is None:
-            cls.refresh()
-            record = cls._instances.get(database)
-        if record is None:
-            raise KeyError(database)
-        return record
+        """Get instance info by database name."""
+        key = cls.resolve(database)
+        return cls._instances[key]
 
-    @classmethod
-    def invalidate(cls, database: str) -> None:
-        cls._instances.pop(database, None)
 
-def make_jsonrpc_request(database: str, method: str, *params):
-    """Make a JSON-RPC request to a specific IDA plugin instance"""
+def _pid_from_socket_path(socket_path: str) -> Optional[int]:
+    """Extract PID prefix from socket filename (format: <pid>_<name>.sock)."""
+
+    try:
+        stem = Path(socket_path).stem
+        pid_part = stem.split("_", 1)[0]
+        pid = int(pid_part)
+        return pid if pid > 0 else None
+    except Exception:
+        return None
+
+
+def _kill_if_ida_process(pid: int) -> bool:
+    """Kill the process if it looks like an IDA binary. Returns True if killed."""
+
+    if os.name != "posix":
+        return False
+
+    try:
+        comm = subprocess.check_output(["ps", "-p", str(pid), "-o", "comm="], text=True).strip().lower()
+    except Exception:
+        return False
+
+    if "ida" not in comm:
+        return False
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return True
+    except Exception:
+        return False
+
+
+def _quick_health_check(socket_path: str) -> bool:
+    """Best-effort ping to see if the MCP socket responds at all."""
+
+    try:
+        _send_jsonrpc_request(socket_path, "system.info", {}, timeout=2.0)
+        return True
+    except Exception:
+        return False
+
+
+def make_jsonrpc_request(database: str, method: str, params: Dict[str, Any]) -> Any:
+    """Make a JSON-RPC request to an IDA instance."""
     try:
         instance = InstanceManager.get(database)
-    except KeyError:
-        raise Exception(
-            f"No IDA instance registered for database '{database}'. "
-            "Use the list_instances tool to see active sessions.",
-        )
+    except InstanceLookupError as exc:
+        raise Exception(str(exc))
 
     socket_path = instance.get("_socket")
-    if not isinstance(socket_path, str) or not socket_path:
-        raise Exception(
-            f"Invalid registration for '{database}' (missing socket). "
-            "Try restarting the MCP plugin inside IDA.",
-        )
+    if not socket_path:
+        raise Exception(f"Invalid instance for '{database}' (missing socket)")
+
+    timeout = METHOD_TIMEOUTS.get(method, DEFAULT_TIMEOUT)
 
     try:
-        return _send_jsonrpc_request(socket_path, method, list(params))
-    except OSError as e:
-        InstanceManager.invalidate(database)
+        result = _send_jsonrpc_request(socket_path, method, params, timeout)
+        _timeout_marks.pop(socket_path, None)
+        return result
+    except socket.timeout:
+        now = time.monotonic()
+        first_timeout = _timeout_marks.get(socket_path, now)
+
+        if not _quick_health_check(socket_path):
+            elapsed = now - first_timeout
+            if elapsed >= KILL_GRACE_SECONDS:
+                pid = _pid_from_socket_path(socket_path)
+                killed = _kill_if_ida_process(pid) if pid else False
+                with suppress(Exception):
+                    Path(socket_path).unlink()
+                InstanceManager.refresh()
+                _timeout_marks.pop(socket_path, None)
+                if killed:
+                    raise Exception(
+                        f"Instance '{database}' became unresponsive (IDA likely crashed/froze after the last command). It was force-terminated (pid {pid}). Please reopen the database."
+                    )
+                raise Exception(
+                    f"Instance '{database}' is unresponsive (IDA likely crashed/froze after the last command). Its socket was removed; please restart IDA for this database."
+                )
+
+            # Not yet past grace period: record and warn
+            _timeout_marks[socket_path] = first_timeout
+            remaining = int(max(0, KILL_GRACE_SECONDS - elapsed))
+            raise Exception(
+                f"Request to '{method}' timed out and IDA is unresponsive; it may be busy or frozen. "
+                f"Will force-terminate if still unresponsive after {remaining}s. You can retry the command after waiting a bit."
+            )
+
+        # Health check succeeded: spin off async job and return job_id so caller can poll result
+        try:
+            job_resp = _send_jsonrpc_request(socket_path, "start_job", {"method": method, "params": params}, 5.0)
+            job_id = job_resp.get("job_id") if isinstance(job_resp, dict) else None
+        except Exception:
+            job_id = None
+
+        _timeout_marks.pop(socket_path, None)
+        if job_id:
+            raise Exception(
+                f"Request to '{method}' timed out after {timeout}s, but IDA is still responding. "
+                f"The operation was re-submitted as async job '{job_id}'. Poll job_status/job_result to retrieve the output (results kept ~5 minutes)."
+            )
         raise Exception(
-            f"Failed to communicate with IDA instance '{database}': {e}. "
-            "Use the list_instances tool to verify that the instance is still running.",
-        ) from e
-    except Exception:
-        raise
+            f"Request to '{method}' timed out after {timeout}s, but IDA is still responding. "
+            "The operation may still be running; consider retrying or increasing the timeout."
+        )
+    except OSError as e:
+        raise Exception(f"Failed to communicate with IDA: {e}")
+
+
+# ============================================================================
+# MCP Tools - The 12 core tools for reverse engineering
+# ============================================================================
+
 
 @mcp.tool()
-def check_connection() -> str:
-    """Check if any IDA instance is available"""
-    instances = InstanceManager.list()
-    if not instances:
-        return "No IDA instances running. Start IDA and load a file."
-
-    # Check if any instance is responsive
-    for instance in instances:
-        try:
-            database = instance.get("database", "")
-            if database:
-                metadata = make_jsonrpc_request(database, "get_metadata")
-                return f"Connected: {database} ({metadata.get('module', 'unknown')})"
-        except Exception:
-            continue
-
-    return f"Found {len(instances)} instance(s) but none responsive."
+def job_status(database: str, job_id: str) -> Dict[str, Any]:
+    """Check status of an async job (created after a timeout)."""
+    return make_jsonrpc_request(database, "job_status", {"job_id": job_id})
 
 
-class BatchToolRequest(TypedDict, total=False):
-    tool: str
-    arguments: Dict[str, Any]
-
-
-class BatchToolResult(TypedDict, total=False):
-    index: int
-    tool: str
-    status: str
-    arguments: Dict[str, Any]
-    output: Any
-    error: str
-    chunk_index: int
-    total_chunks: int
-    output_format: str
-
-
-def _coerce_to_jsonable(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): _coerce_to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_coerce_to_jsonable(v) for v in value]
-    if isinstance(value, Path):
-        return str(value)
-    return repr(value)
-
-
-def _serialized_length(value: Any) -> int:
-    try:
-        return len(json.dumps(value, ensure_ascii=False))
-    except TypeError:
-        return len(json.dumps(_coerce_to_jsonable(value), ensure_ascii=False))
-
-
-def _chunk_text(text: str, size: int) -> List[str]:
-    if size <= 0:
-        size = 1
-    if not text:
-        return [""]
-    return [text[i : i + size] for i in range(0, len(text), size)]
-
-
-def _chunk_batch_result(entry: Dict[str, Any], char_limit: int) -> List[Dict[str, Any]]:
-    base_entry = dict(entry)
-    output = base_entry.pop("output", "")
-    base_entry.pop("chunk_index", None)
-    base_entry.pop("total_chunks", None)
-    base_entry.pop("output_format", None)
-    metadata_len = _serialized_length({**base_entry, "output": ""})
-    available_chars = max(1, char_limit - metadata_len - 2)
-    if isinstance(output, str):
-        raw_output = output
-        output_format = "text"
-    else:
-        raw_output = json.dumps(_coerce_to_jsonable(output), ensure_ascii=False)
-        output_format = "json-string"
-    chunks = _chunk_text(raw_output, available_chars)
-    total_chunks = len(chunks)
-    chunk_entries: List[Dict[str, Any]] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        chunk_entry = dict(base_entry)
-        chunk_entry["output"] = chunk
-        chunk_entry["chunk_index"] = idx
-        chunk_entry["total_chunks"] = total_chunks
-        chunk_entry["output_format"] = output_format
-        chunk_entries.append(chunk_entry)
-    return chunk_entries
+@mcp.tool()
+def job_result(database: str, job_id: str, pop: bool = True) -> Dict[str, Any]:
+    """Get result of an async job (optionally remove it from cache)."""
+    return make_jsonrpc_request(database, "job_result", {"job_id": job_id, "pop": pop})
 
 
 @mcp.tool()
 def list_instances() -> str:
-    """List all currently registered IDA MCP plugin instances"""
+    """List all active IDA Pro instances."""
     instances = InstanceManager.list()
     if not instances:
-        return "No IDA instances running."
-
+        return "No IDA instances running. Open IDA Pro and load a binary."
     results = []
-    for instance in instances:
-        db = instance.get("database", "unknown")
-        module = instance.get("module", "unknown")
-        status = instance.get("status", "unknown")
-        results.append(f"{db} ({module}) - {status}")
-
+    for inst in instances:
+        db = inst.get("database", "unknown")
+        status = inst.get("status", "unknown")
+        results.append(f"{db} ({status})")
     return f"Active instances ({len(instances)}): " + ", ".join(results)
 
 
 @mcp.tool()
-def batch_tool_calls(
-    requests: Annotated[List[BatchToolRequest], "List of tool invocations to execute in order."],
-    page: Annotated[int, "1-based page number of the aggregated results to return."] = 1,
-    page_size_tokens: Annotated[
-        int,
-        "Approximate token budget per page (defaults to 25k tokens).",
-    ] = 25000,
-    allow_unsafe: Annotated[
-        bool,
-        "Allow execution of tools marked as unsafe by also passing this flag as True.",
-    ] = False,
+def decompile(
+    database: str,
+    selector: str,
+    start_line: int = 0,
+    end_line: int = 0,
+    max_lines: int = 0,
 ) -> Dict[str, Any]:
-    """Execute multiple MCP tools sequentially and return paginated results."""
+    """Get Hex-Rays pseudocode for a function.
 
-    if page <= 0:
-        raise ValueError("page must be a positive integer")
-    if page_size_tokens <= 0:
-        raise ValueError("page_size_tokens must be a positive integer")
-    if not isinstance(requests, list):
-        raise ValueError("requests must be provided as a list")
+    Args:
+        database: Database filename of the IDA instance
+        selector: Function name or "0xADDRESS"
+        start_line: Start at this line (1-indexed, 0 = from beginning)
+        end_line: End at this line (inclusive, 0 = to end)
+        max_lines: Maximum lines to return (0 = no limit, overrides end_line)
 
-    approx_char_limit = max(1, page_size_tokens) * 4
-    available_functions: Dict[str, Callable[..., Any]] = {}
-    for name in MCP_FUNCTIONS:
-        func = globals().get(name)
-        if callable(func):
-            available_functions[name] = func
+    Returns:
+        name, address, prototype, pseudocode, variables, line_info (if filtered)
 
-    results: List[BatchToolResult] = []
-    for idx, request in enumerate(requests, start=1):
-        if not isinstance(request, dict):
-            raise ValueError(f"Request #{idx} must be an object with tool information")
-
-        tool_name = request.get("tool")
-        if not isinstance(tool_name, str) or not tool_name:
-            raise ValueError(f"Request #{idx} is missing a valid tool name")
-        if tool_name == BATCH_TOOL_NAME:
-            raise ValueError("batch_tool_calls cannot invoke itself")
-        if tool_name not in available_functions:
-            raise ValueError(f"Unknown tool '{tool_name}' in request #{idx}")
-        if not allow_unsafe and tool_name in UNSAFE_FUNCTIONS:
-            raise ValueError(
-                f"Tool '{tool_name}' is marked as unsafe. Set allow_unsafe=True to execute it."
-            )
-
-        raw_arguments = request.get("arguments") or {}
-        if not isinstance(raw_arguments, dict):
-            raise ValueError(f"Request #{idx} arguments must be an object")
-
-        normalized_arguments = {str(key): value for key, value in raw_arguments.items()}
-        entry: BatchToolResult = BatchToolResult(
-            index=idx,
-            tool=tool_name,
-            status="success",
-            arguments=_coerce_to_jsonable(normalized_arguments),
-        )
-
-        func = available_functions[tool_name]
-        try:
-            output = func(**raw_arguments)
-        except Exception as exc:  # noqa: BLE001
-            entry["status"] = "error"
-            entry["error"] = str(exc)
-        else:
-            entry["output"] = _coerce_to_jsonable(output)
-
-        results.append(entry)
-
-    if not results:
-        if page != 1:
-            raise ValueError("No results available")
-        return {
-            "page": 1,
-            "total_pages": 1,
-            "has_next": False,
-            "has_prev": False,
-            "page_size_tokens": page_size_tokens,
-            "approx_char_limit": approx_char_limit,
-            "total_requests": 0,
-            "successful_requests": 0,
-            "failed_requests": 0,
-            "results": [],
-        }
-
-    pages: List[List[BatchToolResult]] = []
-    current_page: List[BatchToolResult] = []
-    current_length = 0
-
-    for entry in results:
-        entry_length = _serialized_length(entry)
-        if entry_length > approx_char_limit:
-            chunked_entries = _chunk_batch_result(entry, approx_char_limit)
-            for chunk in chunked_entries:
-                chunk_length = _serialized_length(chunk)
-                if current_page and current_length + chunk_length > approx_char_limit:
-                    pages.append(current_page)
-                    current_page = []
-                    current_length = 0
-                current_page.append(chunk)
-                current_length += chunk_length
-            continue
-
-        if current_page and current_length + entry_length > approx_char_limit:
-            pages.append(current_page)
-            current_page = []
-            current_length = 0
-
-        current_page.append(entry)
-        current_length += entry_length
-
-    if current_page:
-        pages.append(current_page)
-    if not pages:
-        pages.append([])
-
-    total_pages = len(pages)
-    if page > total_pages:
-        raise ValueError(f"Requested page {page} is out of range (max {total_pages})")
-
-    success_count = sum(1 for entry in results if entry["status"] == "success")
-    failure_count = len(results) - success_count
-
-    page_results = pages[page - 1]
-
-    return {
-        "page": page,
-        "total_pages": total_pages,
-        "has_next": page < total_pages,
-        "has_prev": page > 1,
-        "page_size_tokens": page_size_tokens,
-        "approx_char_limit": approx_char_limit,
-        "total_requests": len(results),
-        "successful_requests": success_count,
-        "failed_requests": failure_count,
-        "results": page_results,
-    }
+    Examples:
+        - Get first 20 lines: max_lines=20
+        - Get lines 10-30: start_line=10, end_line=30
+        - Get 15 lines from line 25: start_line=25, max_lines=15
+    """
+    return make_jsonrpc_request(database, "decompile", {
+        "selector": selector,
+        "start_line": start_line,
+        "end_line": end_line,
+        "max_lines": max_lines,
+    })
 
 
-# Code taken from https://github.com/mrexodia/ida-pro-mcp (MIT License)
-class MCPVisitor(ast.NodeVisitor):
-    def __init__(self):
-        self.types: dict[str, ast.ClassDef] = {}
-        self.functions: dict[str, ast.FunctionDef] = {}
-        self.descriptions: dict[str, str] = {}
-        self.unsafe: list[str] = []
+@mcp.tool()
+def disassemble(
+    database: str,
+    selector: str,
+    max_instructions: int = 200,
+) -> str:
+    """Get assembly instructions for a function or address range.
 
-    def visit_FunctionDef(self, node):
-        for decorator in node.decorator_list:
-            if isinstance(decorator, ast.Name):
-                if decorator.id == "jsonrpc":
-                    database_arg = ast.arg(
-                        arg="database",
-                        annotation=ast.Subscript(
-                            value=ast.Name(id="Annotated", ctx=ast.Load()),
-                            slice=ast.Tuple(
-                                elts=[
-                                    ast.Name(id="str", ctx=ast.Load()),
-                                    ast.Constant(
-                                        value="Database filename of the IDA instance to query",
-                                    ),
-                                ],
-                                ctx=ast.Load(),
-                            ),
-                            ctx=ast.Load(),
-                        ),
-                        type_comment=None,
-                    )
-                    for i, arg in enumerate(node.args.args):
-                        arg_name = arg.arg
-                        arg_type = arg.annotation
-                        if arg_type is None:
-                            raise Exception(f"Missing argument type for {node.name}.{arg_name}")
-                        if isinstance(arg_type, ast.Subscript):
-                            assert isinstance(arg_type.value, ast.Name)
-                            assert arg_type.value.id == "Annotated"
-                            assert isinstance(arg_type.slice, ast.Tuple)
-                            assert len(arg_type.slice.elts) == 2
-                            annot_type = arg_type.slice.elts[0]
-                            annot_description = arg_type.slice.elts[1]
-                            assert isinstance(annot_description, ast.Constant)
-                            node.args.args[i].annotation = ast.Subscript(
-                                value=ast.Name(id="Annotated", ctx=ast.Load()),
-                                slice=ast.Tuple(
-                                    elts=[
-                                    annot_type,
-                                    ast.Call(
-                                        func=ast.Name(id="Field", ctx=ast.Load()),
-                                        args=[],
-                                        keywords=[
-                                        ast.keyword(
-                                            arg="description",
-                                            value=annot_description)])],
-                                    ctx=ast.Load()),
-                                ctx=ast.Load())
-                        elif isinstance(arg_type, ast.Name):
-                            pass
-                        else:
-                            raise Exception(f"Unexpected type annotation for {node.name}.{arg_name} -> {type(arg_type)}")
+    Args:
+        database: Database filename of the IDA instance
+        selector: Function name, "0xADDRESS", or "0xSTART-0xEND"
+        max_instructions: Maximum instructions to return (default 200)
 
-                    body_comment = node.body[0]
-                    if isinstance(body_comment, ast.Expr) and isinstance(body_comment.value, ast.Constant):
-                        new_body = [body_comment]
-                        self.descriptions[node.name] = body_comment.value.value
-                    else:
-                        new_body = []
+    Returns:
+        Plaintext disassembly (newline separated)
+    """
+    return make_jsonrpc_request(database, "disassemble", {
+        "selector": selector,
+        "max_instructions": max_instructions,
+    })
 
-                    call_args = [ast.Name(id="database", ctx=ast.Load()), ast.Constant(value=node.name)]
-                    for arg in node.args.args:
-                        call_args.append(ast.Name(id=arg.arg, ctx=ast.Load()))
-                    new_body.append(ast.Return(
-                        value=ast.Call(
-                            func=ast.Name(id="make_jsonrpc_request", ctx=ast.Load()),
-                            args=call_args,
-                            keywords=[])))
-                    decorator_list = [
-                        ast.Call(
-                            func=ast.Attribute(
-                                value=ast.Name(id="mcp", ctx=ast.Load()),
-                                attr="tool",
-                                ctx=ast.Load()),
-                            args=[],
-                            keywords=[]
-                        )
-                    ]
-                    new_args = ast.arguments(
-                        posonlyargs=list(node.args.posonlyargs),
-                        args=[database_arg] + list(node.args.args),
-                        vararg=node.args.vararg,
-                        kwonlyargs=list(node.args.kwonlyargs),
-                        kw_defaults=list(node.args.kw_defaults),
-                        kwarg=node.args.kwarg,
-                        defaults=list(node.args.defaults),
-                    )
-                    node_nobody = ast.FunctionDef(
-                        node.name,
-                        new_args,
-                        new_body,
-                        decorator_list,
-                        node.returns,
-                        node.type_comment,
-                        lineno=node.lineno,
-                        col_offset=node.col_offset,
-                    )
-                    assert node.name not in self.functions, f"Duplicate function: {node.name}"
-                    self.functions[node.name] = node_nobody
-                elif decorator.id == "unsafe":
-                    self.unsafe.append(node.name)
 
-    def visit_ClassDef(self, node):
-        for base in node.bases:
-            if isinstance(base, ast.Name):
-                if base.id == "TypedDict":
-                    self.types[node.name] = node
+@mcp.tool()
+def list_functions(
+    database: str,
+    filter: str = "",
+    offset: int = 0,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """List all functions with basic info.
 
+    Args:
+        database: Database filename of the IDA instance
+        filter: Optional regex to filter by name
+        offset: Start index for pagination
+        limit: Number of functions to return
+
+    Returns:
+        functions[], total, offset, limit, has_more
+    """
+    return make_jsonrpc_request(database, "list_functions", {
+        "filter": filter,
+        "offset": offset,
+        "limit": limit,
+    })
+
+
+@mcp.tool()
+def get_xrefs(
+    database: str,
+    target: str,
+    direction: str = "to",
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Get cross-references to/from an address or function.
+
+    Args:
+        database: Database filename of the IDA instance
+        target: Address or function name
+        direction: "to" (callers), "from" (callees), or "both"
+        limit: Maximum xrefs to return
+
+    Returns:
+        xrefs[] (includes source disassembly line), count, limit, has_more
+    """
+    return make_jsonrpc_request(database, "get_xrefs", {
+        "target": target,
+        "direction": direction,
+        "limit": limit,
+    })
+
+
+@mcp.tool()
+def search_strings(
+    database: str,
+    pattern: str = "",
+    min_length: int = 4,
+    offset: int = 0,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Find strings in the binary.
+
+    Args:
+        database: Database filename of the IDA instance
+        pattern: Optional regex to filter strings
+        min_length: Minimum string length (default 4)
+        offset: Start index for pagination
+        limit: Maximum strings to return
+
+    Returns:
+        strings[], total, offset, limit, has_more
+    """
+    return make_jsonrpc_request(database, "search_strings", {
+        "pattern": pattern,
+        "min_length": min_length,
+        "offset": offset,
+        "limit": limit,
+    })
+
+
+@mcp.tool()
+def read_bytes(
+    database: str,
+    address: str,
+    size: int = 64,
+) -> Dict[str, Any]:
+    """Read raw bytes at an address.
+
+    Args:
+        database: Database filename of the IDA instance
+        address: Hex address to read from
+        size: Number of bytes to read (default 64)
+
+    Returns:
+        hex, ascii, dump[]
+    """
+    return make_jsonrpc_request(database, "read_bytes", {
+        "address": address,
+        "size": size,
+    })
+
+
+@mcp.tool()
+def search(
+    database: str,
+    query: str,
+    search_type: str = "auto",
+    start_address: str = "",
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Search for bytes, immediates, or text patterns in the binary.
+
+    Args:
+        database: Database filename of the IDA instance
+        query: What to search for:
+            - Hex bytes: "48 89 E5" or "488BE5" (spaces optional)
+            - Immediate value: "0x1000" or "4096"
+            - Text/regex: "encrypt" or "call.*malloc"
+        search_type: "bytes", "immediate", "text", or "auto" (default, auto-detects)
+        start_address: Address to start searching from (default: start of binary)
+        limit: Maximum results to return (default 100)
+
+    Returns:
+        results[], search_type, count, limit, has_more
+    """
+    return make_jsonrpc_request(database, "search", {
+        "query": query,
+        "search_type": search_type,
+        "start_address": start_address,
+        "limit": limit,
+    })
+
+
+@mcp.tool()
+def rename(
+    database: str,
+    target: str,
+    new_name: str,
+) -> Dict[str, Any]:
+    """Rename a function, global, or struct field.
+
+    Args:
+        database: Database filename of the IDA instance
+        target: Address ("0xADDRESS"), function name, or "StructName.field"
+        new_name: New name to assign
+
+    Returns:
+        old_name, new_name, type
+    """
+    return make_jsonrpc_request(database, "rename", {
+        "target": target,
+        "new_name": new_name,
+    })
+
+
+@mcp.tool()
+def set_type(
+    database: str,
+    target: str,
+    type_str: str,
+) -> Dict[str, Any]:
+    """Set the type of a function, variable, or global.
+
+    Args:
+        database: Database filename of the IDA instance
+        target: Address or name
+        type_str: C type declaration (e.g., "int (*handler)(void *ctx, char *data)")
+
+    Returns:
+        success, applied_type
+    """
+    return make_jsonrpc_request(database, "set_type", {
+        "target": target,
+        "type_str": type_str,
+    })
+
+
+@mcp.tool()
+def create_struct(
+    database: str,
+    name: str,
+    definition: str,
+) -> Dict[str, Any]:
+    """Create a new struct type from C definition.
+
+    Args:
+        database: Database filename of the IDA instance
+        name: Struct name
+        definition: C-style struct definition (e.g., "struct Foo { int x; char buf[64]; }")
+
+    Returns:
+        name, size, members[]
+    """
+    return make_jsonrpc_request(database, "create_struct", {
+        "name": name,
+        "definition": definition,
+    })
+
+
+@mcp.tool()
+def set_comment(
+    database: str,
+    address: str,
+    comment: str,
+    comment_type: str = "line",
+) -> Dict[str, Any]:
+    """Add a comment at an address.
+
+    Args:
+        database: Database filename of the IDA instance
+        address: Hex address
+        comment: Comment text
+        comment_type: "line" (default), "function", or "repeatable"
+
+    Returns:
+        success
+    """
+    return make_jsonrpc_request(database, "set_comment", {
+        "address": address,
+        "comment": comment,
+        "comment_type": comment_type,
+    })
+
+
+@mcp.tool()
+def info(
+    database: str,
+) -> Dict[str, Any]:
+    """Get current database info and cursor position.
+
+    Args:
+        database: Database filename of the IDA instance
+
+    Returns:
+        database, cursor_address, cursor_function, arch, total_functions
+    """
+    return make_jsonrpc_request(database, "info", {})
+
+
+@mcp.tool()
+def get_callgraph(
+    database: str,
+    target: str,
+    max_depth: int = 3,
+    direction: str = "both",
+) -> Dict[str, Any]:
+    """Get call graph for a function.
+
+    Args:
+        database: Database filename of the IDA instance
+        target: Function name or address
+        max_depth: Maximum depth to traverse (default 3)
+        direction: "callers" (who calls this), "callees" (what this calls), or "both"
+
+    Returns:
+        root function info with nested callers/callees tree
+    """
+    return make_jsonrpc_request(database, "get_callgraph", {
+        "target": target,
+        "max_depth": max_depth,
+        "direction": direction,
+    })
+
+
+@mcp.tool()
+def get_segments(
+    database: str,
+) -> Dict[str, Any]:
+    """Get memory segments/sections of the binary.
+
+    Args:
+        database: Database filename of the IDA instance
+
+    Returns:
+        segments[] with name, start, end, size, permissions, class
+    """
+    return make_jsonrpc_request(database, "get_segments", {})
+
+
+@mcp.tool()
+def script_exec(
+    database: str,
+    script: str,
+) -> Dict[str, Any]:
+    """Execute arbitrary Python code in IDA.
+
+    Args:
+        database: Database filename of the IDA instance
+        script: Python code to execute
+
+    Returns:
+        success, stdout, stderr, error
+    """
+    return make_jsonrpc_request(database, "script_exec", {
+        "script": script,
+    })
+
+
+# ============================================================================
+# MCP Prompts - Guided analysis workflows
+# ============================================================================
+
+@mcp.prompt()
+def analyze_function(database: str, function: str) -> str:
+    """Systematic function analysis guide.
+
+    Args:
+        database: Database filename of the IDA instance
+        function: Function name or address to analyze
+    """
+    return f"""Analyze the function '{function}' in database '{database}' systematically:
+
+1. First, get the function's pseudocode:
+   decompile(database="{database}", selector="{function}")
+
+2. Get the assembly for low-level details:
+   disassemble(database="{database}", selector="{function}")
+
+3. Understand the call context:
+   get_xrefs(database="{database}", target="{function}", direction="to")
+   get_callgraph(database="{database}", target="{function}", max_depth=2)
+
+After gathering this information, provide:
+- **Purpose**: What does this function do?
+- **Parameters**: What are the inputs and how are they used?
+- **Return value**: What does it return and what does that mean?
+- **Side effects**: Does it modify global state, write to files, make network calls?
+- **Algorithm**: Describe the logic step by step
+- **Security concerns**: Any potential vulnerabilities or dangerous patterns?
+
+Once you understand the function, use rename() and set_comment() to document your findings in IDA."""
+
+
+@mcp.prompt()
+def identify_vulnerabilities(database: str, function: str) -> str:
+    """Security-focused vulnerability analysis.
+
+    Args:
+        database: Database filename of the IDA instance
+        function: Function name or address to analyze
+    """
+    return f"""Perform security analysis on '{function}' in database '{database}':
+
+1. Get the decompiled code:
+   decompile(database="{database}", selector="{function}")
+
+2. Get assembly for precise understanding:
+   disassemble(database="{database}", selector="{function}")
+
+3. Check what calls this function (attack surface):
+   get_xrefs(database="{database}", target="{function}", direction="to")
+
+Analyze for these vulnerability classes:
+
+**Memory Safety**
+- Buffer overflow/underflow (fixed-size buffers, missing bounds checks)
+- Integer overflow leading to small allocations
+- Use-after-free / double-free
+- Uninitialized memory use
+
+**Input Validation**
+- Format string vulnerabilities (user input to printf-family)
+- Command injection (user input to system/exec)
+- Path traversal (user input in file paths)
+- SQL/NoSQL injection patterns
+
+**Logic Issues**
+- Race conditions (TOCTOU)
+- Missing authentication/authorization checks
+- Cryptographic weaknesses (weak algorithms, hardcoded keys)
+- Information disclosure
+
+For each potential vulnerability found:
+1. **Location**: Exact address/line
+2. **Description**: What the bug is
+3. **Impact**: What an attacker could achieve
+4. **Exploitation**: How it might be triggered
+5. **Remediation**: How to fix it
+
+Use set_comment() to annotate vulnerable code locations."""
+
+
+@mcp.prompt()
+def reverse_engineer_binary(database: str) -> str:
+    """Comprehensive binary reverse engineering guide.
+
+    Args:
+        database: Database filename of the IDA instance
+    """
+    return f"""Systematically reverse engineer the binary '{database}':
+
+## Phase 1: Reconnaissance
+
+1. Get binary overview:
+   info(database="{database}")
+   get_segments(database="{database}")
+
+2. Find interesting strings:
+   search_strings(database="{database}", pattern="password|key|secret|token|api", limit=50)
+   search_strings(database="{database}", pattern="http|https|ftp|ssh", limit=50)
+   search_strings(database="{database}", pattern="error|fail|invalid", limit=50)
+
+3. List functions and identify patterns:
+   list_functions(database="{database}", filter="main", limit=20)
+   list_functions(database="{database}", filter="init|setup|start", limit=20)
+   list_functions(database="{database}", filter="crypt|encrypt|decrypt|hash", limit=20)
+   list_functions(database="{database}", filter="net|socket|connect|send|recv", limit=20)
+
+## Phase 2: Entry Point Analysis
+
+4. Start from main/entry and trace execution:
+   - Decompile entry points
+   - Follow the call graph to understand program flow
+   - Identify initialization routines
+
+## Phase 3: Functional Mapping
+
+5. Categorize functions by purpose:
+   - Network communication
+   - File I/O
+   - Cryptography
+   - String manipulation
+   - Configuration/settings
+
+6. For each important function:
+   - Decompile and understand
+   - Rename with descriptive names
+   - Add comments explaining purpose
+   - Set proper types for parameters
+
+## Phase 4: Data Structure Recovery
+
+7. Identify and document data structures:
+   - Look for structs passed between functions
+   - Use create_struct() to define them
+   - Apply types with set_type()
+
+## Phase 5: Documentation
+
+8. Build a complete picture:
+   - Document the program's purpose
+   - Map out the architecture
+   - Note any malicious/interesting behavior
+   - Identify C2, persistence, evasion techniques if malware
+
+Use rename(), set_type(), create_struct(), and set_comment() throughout to document findings."""
+
+
+@mcp.prompt()
+def analyze_malware(database: str) -> str:
+    """Malware-specific analysis guide.
+
+    Args:
+        database: Database filename of the IDA instance
+    """
+    return f"""Analyze potential malware in '{database}':
+
+## Phase 1: Triage
+
+1. Basic info and structure:
+   info(database="{database}")
+   get_segments(database="{database}")
+
+2. Look for malware indicators in strings:
+   search_strings(database="{database}", pattern="cmd|powershell|bash|sh", limit=30)
+   search_strings(database="{database}", pattern="RegSetValue|CreateService|schtasks", limit=30)
+   search_strings(database="{database}", pattern="VirtualAlloc|VirtualProtect|NtUnmap", limit=30)
+   search_strings(database="{database}", pattern="http|https|socket|connect|recv|send", limit=30)
+   search_strings(database="{database}", pattern="password|credential|token|key", limit=30)
+
+## Phase 2: Capability Analysis
+
+3. Find functions related to:
+
+   **Persistence**:
+   list_functions(database="{database}", filter="registry|service|schedule|startup", limit=20)
+
+   **C2 Communication**:
+   list_functions(database="{database}", filter="http|socket|connect|beacon|command", limit=20)
+
+   **Data Exfiltration**:
+   list_functions(database="{database}", filter="upload|send|post|exfil", limit=20)
+
+   **Evasion**:
+   list_functions(database="{database}", filter="anti|debug|vm|sandbox|detect", limit=20)
+
+   **Payload**:
+   list_functions(database="{database}", filter="inject|hollow|load|exec|shell", limit=20)
+
+## Phase 3: Deep Dive
+
+4. For each capability identified:
+   - Decompile the relevant functions
+   - Trace the call graph
+   - Document the technique used
+   - Note IOCs (IPs, domains, file paths, registry keys)
+
+## Phase 4: Report
+
+Produce a malware analysis report covering:
+- **Family/Type**: What kind of malware is this?
+- **Capabilities**: What can it do?
+- **C2 Protocol**: How does it communicate?
+- **Persistence**: How does it survive reboot?
+- **Evasion**: What anti-analysis techniques does it use?
+- **IOCs**: Network indicators, file paths, registry keys
+- **MITRE ATT&CK**: Map techniques to ATT&CK framework"""
+
+
+# ============================================================================
+# Installation and Setup
+# ============================================================================
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 IDA_PLUGIN_PY = os.path.join(SCRIPT_DIR, "mcp-plugin.py")
-GENERATED_PY = os.path.join(SCRIPT_DIR, "server_generated.py")
 
-# NOTE: This is in the global scope on purpose
-if not os.path.exists(IDA_PLUGIN_PY):
-    raise RuntimeError(f"IDA plugin not found at {IDA_PLUGIN_PY} (did you move it?)")
-with open(IDA_PLUGIN_PY, "r", encoding="utf-8") as f:
-    code = f.read()
-module = ast.parse(code, IDA_PLUGIN_PY)
-visitor = MCPVisitor()
-visitor.visit(module)
-code = """# NOTE: This file has been automatically generated, do not modify!
-# Architecture based on https://github.com/mrexodia/ida-pro-mcp (MIT License)
-import sys
-if sys.version_info >= (3, 12):
-    from typing import Annotated, Optional, TypedDict, Generic, TypeVar, NotRequired
-else:
-    from typing_extensions import Annotated, Optional, TypedDict, Generic, TypeVar, NotRequired
-from pydantic import Field
-
-T = TypeVar("T")
-
-"""
-for type in visitor.types.values():
-    code += ast.unparse(type)
-    code += "\n\n"
-for function in visitor.functions.values():
-    code += ast.unparse(function)
-    code += "\n\n"
-
-try:
-    if os.path.exists(GENERATED_PY):
-        with open(GENERATED_PY, "rb") as f:
-            existing_code_bytes = f.read()
-    else:
-        existing_code_bytes = b""
-    code_bytes = code.encode("utf-8").replace(b"\r", b"")
-    if code_bytes != existing_code_bytes:
-        with open(GENERATED_PY, "wb") as f:
-            f.write(code_bytes)
-except:
-    print(f"Failed to generate code: {GENERATED_PY}", file=sys.stderr, flush=True)
-
-exec(compile(code, GENERATED_PY, "exec"))
-
-MCP_FUNCTIONS = ["check_connection", "list_instances"] + list(visitor.functions.keys())
-UNSAFE_FUNCTIONS = visitor.unsafe
-SAFE_FUNCTIONS = [f for f in MCP_FUNCTIONS if f not in UNSAFE_FUNCTIONS]
-
-if BATCH_TOOL_NAME not in MCP_FUNCTIONS:
-    MCP_FUNCTIONS.append(BATCH_TOOL_NAME)
-    if BATCH_TOOL_NAME not in UNSAFE_FUNCTIONS:
-        SAFE_FUNCTIONS.append(BATCH_TOOL_NAME)
-
-def generate_readme():
-    print("README:")
-    print("- `check_connection()`: Check if any IDA instance is available.")
-    print("- `list_instances()`: List all currently registered IDA databases (compact format).")
-    print(
-        "- `batch_tool_calls(requests, page=1, page_size_tokens=25000, allow_unsafe=False)`: "
-        "Execute multiple MCP tools sequentially and retrieve paginated results."
-    )
-    def get_description(name: str):
-        function = visitor.functions.get(name)
-        if function is None:
-            return None
-        signature = function.name + "("
-        for i, arg in enumerate(function.args.args):
-            if i > 0:
-                signature += ", "
-            signature += arg.arg
-        signature += ")"
-        description = visitor.descriptions.get(function.name, "<no description>").strip()
-        if description[-1] != ".":
-            description += "."
-        return f"- `{signature}`: {description}"
-    for safe_function in SAFE_FUNCTIONS:
-        description = get_description(safe_function)
-        if description is not None:
-            print(description)
-    print("\nUnsafe functions (`--unsafe` flag required):\n")
-    for unsafe_function in UNSAFE_FUNCTIONS:
-        description = get_description(unsafe_function)
-        if description is not None:
-            print(description)
-    print("\nMCP Config:")
-    mcp_config = {
-        "mcpServers": {
-            "github.com/mrexodia/ida-pro-mcp": {
-            "command": "uv",
-            "args": [
-                "--directory",
-                "c:\\MCP\\ida-pro-mcp",
-                "run",
-                "server.py",
-                "--install-plugin"
-            ],
-            "timeout": 1800,
-            "disabled": False,
-            }
-        }
-    }
-    print(json.dumps(mcp_config, indent=2))
 
 def get_python_executable():
-    """Get the path to the Python executable"""
+    """Get the path to the Python executable."""
     venv = os.environ.get("VIRTUAL_ENV")
     if venv:
         if sys.platform == "win32":
@@ -658,229 +919,112 @@ def get_python_executable():
             python = os.path.join(venv, "bin", "python3")
         if os.path.exists(python):
             return python
-
-    for path in sys.path:
-        if sys.platform == "win32":
-            path = path.replace("/", "\\")
-
-        split = path.split(os.sep)
-        if split[-1].endswith(".zip"):
-            path = os.path.dirname(path)
-            if sys.platform == "win32":
-                python_executable = os.path.join(path, "python.exe")
-            else:
-                python_executable = os.path.join(path, "..", "bin", "python3")
-            python_executable = os.path.abspath(python_executable)
-
-            if os.path.exists(python_executable):
-                return python_executable
     return sys.executable
 
-def copy_python_env(env: dict[str, str]):
-    # Reference: https://docs.python.org/3/using/cmdline.html#environment-variables
-    python_vars = [
-        "PYTHONHOME",
-        "PYTHONPATH",
-        "PYTHONSAFEPATH",
-        "PYTHONPLATLIBDIR",
-        "PYTHONPYCACHEPREFIX",
-        "PYTHONNOUSERSITE",
-        "PYTHONUSERBASE",
-    ]
-    # MCP servers are run without inheriting the environment, so we need to forward
-    # the environment variables that affect Python's dependency resolution by hand.
-    # Issue: https://github.com/mrexodia/ida-pro-mcp/issues/111
-    result = False
-    for var in python_vars:
-        value = os.environ.get(var)
-        if value:
-            result = True
-            env[var] = value
-    return result
-
-def print_mcp_config():
-    mcp_config = {
-        "command": get_python_executable(),
-        "args": [
-            __file__,
-        ],
-        "timeout": 1800,
-        "disabled": False,
-    }
-    env = {}
-    if copy_python_env(env):
-        print(f"[WARNING] Custom Python environment variables detected")
-        mcp_config["env"] = env
-    print(json.dumps({
-            "mcpServers": {
-                mcp.name: mcp_config
-            }
-        }, indent=2)
-    )
-
-def install_mcp_servers(*, uninstall=False, quiet=False, env={}):
-    if sys.platform == "win32":
-        configs = {
-            "Cline": (os.path.join(os.getenv("APPDATA"), "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings"), "cline_mcp_settings.json"),
-            "Roo Code": (os.path.join(os.getenv("APPDATA"), "Code", "User", "globalStorage", "rooveterinaryinc.roo-cline", "settings"), "mcp_settings.json"),
-            "Kilo Code": (os.path.join(os.getenv("APPDATA"), "Code", "User", "globalStorage", "kilocode.kilo-code", "settings"), "mcp_settings.json"),
-            "Claude": (os.path.join(os.getenv("APPDATA"), "Claude"), "claude_desktop_config.json"),
-            "Cursor": (os.path.join(os.path.expanduser("~"), ".cursor"), "mcp.json"),
-            "Windsurf": (os.path.join(os.path.expanduser("~"), ".codeium", "windsurf"), "mcp_config.json"),
-            "Claude Code": (os.path.join(os.path.expanduser("~")), ".claude.json"),
-            "LM Studio": (os.path.join(os.path.expanduser("~"), ".lmstudio"), "mcp.json"),
-        }
-    elif sys.platform == "darwin":
-        configs = {
-            "Cline": (os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings"), "cline_mcp_settings.json"),
-            "Roo Code": (os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Code", "User", "globalStorage", "rooveterinaryinc.roo-cline", "settings"), "mcp_settings.json"),
-            "Kilo Code": (os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Code", "User", "globalStorage", "kilocode.kilo-code", "settings"), "mcp_settings.json"),
-            "Claude": (os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Claude"), "claude_desktop_config.json"),
-            "Cursor": (os.path.join(os.path.expanduser("~"), ".cursor"), "mcp.json"),
-            "Windsurf": (os.path.join(os.path.expanduser("~"), ".codeium", "windsurf"), "mcp_config.json"),
-            "Claude Code": (os.path.join(os.path.expanduser("~")), ".claude.json"),
-            "LM Studio": (os.path.join(os.path.expanduser("~"), ".lmstudio"), "mcp.json"),
-        }
-    elif sys.platform == "linux":
-        configs = {
-            "Cline": (os.path.join(os.path.expanduser("~"), ".config", "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings"), "cline_mcp_settings.json"),
-            "Roo Code": (os.path.join(os.path.expanduser("~"), ".config", "Code", "User", "globalStorage", "rooveterinaryinc.roo-cline", "settings"), "mcp_settings.json"),
-            "Kilo Code": (os.path.join(os.path.expanduser("~"), ".config", "Code", "User", "globalStorage", "kilocode.kilo-code", "settings"), "mcp_settings.json"),
-            # Claude not supported on Linux
-            "Cursor": (os.path.join(os.path.expanduser("~"), ".cursor"), "mcp.json"),
-            "Windsurf": (os.path.join(os.path.expanduser("~"), ".codeium", "windsurf"), "mcp_config.json"),
-            "Claude Code": (os.path.join(os.path.expanduser("~")), ".claude.json"),
-            "LM Studio": (os.path.join(os.path.expanduser("~"), ".lmstudio"), "mcp.json"),
-        }
-    else:
-        print(f"Unsupported platform: {sys.platform}")
-        return
-
-    installed = 0
-    for name, (config_dir, config_file) in configs.items():
-        config_path = os.path.join(config_dir, config_file)
-        if not os.path.exists(config_dir):
-            action = "uninstall" if uninstall else "installation"
-            if not quiet:
-                print(f"Skipping {name} {action}\n  Config: {config_path} (not found)")
-            continue
-        if not os.path.exists(config_path):
-            config = {}
-        else:
-            with open(config_path, "r", encoding="utf-8") as f:
-                data = f.read().strip()
-                if len(data) == 0:
-                    config = {}
-                else:
-                    try:
-                        config = json.loads(data)
-                    except json.decoder.JSONDecodeError:
-                        if not quiet:
-                            print(f"Skipping {name} uninstall\n  Config: {config_path} (invalid JSON)")
-                        continue
-        if "mcpServers" not in config:
-            config["mcpServers"] = {}
-        mcp_servers = config["mcpServers"]
-        # Migrate old name
-        old_name = "github.com/mrexodia/ida-pro-mcp"
-        if old_name in mcp_servers:
-            mcp_servers[mcp.name] = mcp_servers[old_name]
-            del mcp_servers[old_name]
-        if uninstall:
-            if mcp.name not in mcp_servers:
-                if not quiet:
-                    print(f"Skipping {name} uninstall\n  Config: {config_path} (not installed)")
-                continue
-            del mcp_servers[mcp.name]
-        else:
-            # Copy environment variables from the existing server if present
-            if mcp.name in mcp_servers:
-                for key, value in mcp_servers[mcp.name].get("env", {}):
-                    env[key] = value
-            if copy_python_env(env):
-                print(f"[WARNING] Custom Python environment variables detected")
-            mcp_servers[mcp.name] = {
-                "command": get_python_executable(),
-                "args": [
-                    __file__,
-                ],
-                "timeout": 1800,
-                "disabled": False,
-                "autoApprove": SAFE_FUNCTIONS,
-                "alwaysAllow": SAFE_FUNCTIONS,
-            }
-            if env:
-                mcp_servers[mcp.name]["env"] = env
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-        if not quiet:
-            action = "Uninstalled" if uninstall else "Installed"
-            print(f"{action} {name} MCP server (restart required)\n  Config: {config_path}")
-        installed += 1
-    if not uninstall and installed == 0:
-        print("No MCP servers installed. For unsupported MCP clients, use the following config:\n")
-        print_mcp_config()
 
 def install_ida_plugin(*, uninstall: bool = False, quiet: bool = False):
+    """Install or uninstall the IDA plugin."""
     if sys.platform == "win32":
         ida_folder = os.path.join(os.getenv("APPDATA"), "Hex-Rays", "IDA Pro")
     else:
         ida_folder = os.path.join(os.path.expanduser("~"), ".idapro")
-    free_licenses = glob(os.path.join(ida_folder, "idafree_*.hexlic"))
-    if len(free_licenses) > 0:
-        print(f"IDA Free does not support plugins and cannot be used. Purchase and install IDA Pro instead.")
-        sys.exit(1)
+
     ida_plugin_folder = os.path.join(ida_folder, "plugins")
     plugin_destination = os.path.join(ida_plugin_folder, "mcp-plugin.py")
+
     if uninstall:
-        if not os.path.exists(plugin_destination):
-            print(f"Skipping IDA plugin uninstall\n  Path: {plugin_destination} (not found)")
-            return
+        if os.path.exists(plugin_destination):
+            os.remove(plugin_destination)
+            if not quiet:
+                print(f"Uninstalled IDA plugin: {plugin_destination}")
+        return
+
+    os.makedirs(ida_plugin_folder, exist_ok=True)
+
+    # Create symlink or copy
+    if os.path.lexists(plugin_destination):
         os.remove(plugin_destination)
-        if not quiet:
-            print(f"Uninstalled IDA plugin\n  Path: {plugin_destination}")
-    else:
-        # Create IDA plugins folder
-        if not os.path.exists(ida_plugin_folder):
-            os.makedirs(ida_plugin_folder)
 
-        # Skip if symlink already up to date
-        realpath = os.path.realpath(plugin_destination)
-        if realpath == IDA_PLUGIN_PY:
+    try:
+        os.symlink(IDA_PLUGIN_PY, plugin_destination)
+    except OSError:
+        shutil.copy(IDA_PLUGIN_PY, plugin_destination)
+
+    if not quiet:
+        print(f"Installed IDA plugin: {plugin_destination}")
+
+
+def install_mcp_servers(*, uninstall: bool = False, quiet: bool = False):
+    """Install MCP server configuration for various clients."""
+    if sys.platform == "darwin":
+        configs = {
+            "Claude": (os.path.expanduser("~/Library/Application Support/Claude"), "claude_desktop_config.json"),
+            "Cursor": (os.path.expanduser("~/.cursor"), "mcp.json"),
+            "Claude Code": (os.path.expanduser("~"), ".claude.json"),
+        }
+    elif sys.platform == "win32":
+        configs = {
+            "Claude": (os.path.join(os.path.expanduser("~"), "Claude"), "claude_desktop_config.json"),
+            "Cursor": (os.path.join(os.path.expanduser("~"), ".cursor"), "mcp.json"),
+            "Claude Code": (os.path.expanduser("~"), ".claude.json"),
+        }
+    else:  # Linux
+        configs = {
+            "Cursor": (os.path.expanduser("~/.cursor"), "mcp.json"),
+            "Claude Code": (os.path.expanduser("~"), ".claude.json"),
+        }
+
+    for name, (config_dir, config_file) in configs.items():
+        config_path = os.path.join(config_dir, config_file)
+
+        if not os.path.exists(config_dir):
             if not quiet:
-                print(f"Skipping IDA plugin installation (symlink up to date)\n  Plugin: {realpath}")
-        else:
-            # Remove existing plugin
-            if os.path.lexists(plugin_destination):
-                os.remove(plugin_destination)
+                print(f"Skipping {name} (directory not found)")
+            continue
 
-            # Symlink or copy the plugin
+        # Load existing config
+        if os.path.exists(config_path):
             try:
-                os.symlink(IDA_PLUGIN_PY, plugin_destination)
-            except OSError:
-                shutil.copy(IDA_PLUGIN_PY, plugin_destination)
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+            except:
+                config = {}
+        else:
+            config = {}
 
+        if "mcpServers" not in config:
+            config["mcpServers"] = {}
+
+        if uninstall:
+            if mcp.name in config["mcpServers"]:
+                del config["mcpServers"][mcp.name]
+                with open(config_path, "w") as f:
+                    json.dump(config, f, indent=2)
+                if not quiet:
+                    print(f"Uninstalled from {name}")
+        else:
+            config["mcpServers"][mcp.name] = {
+                "command": get_python_executable(),
+                "args": [__file__],
+                "timeout": 1800,
+            }
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2)
             if not quiet:
-                print(f"Installed IDA Pro plugin (IDA restart required)\n  Plugin: {plugin_destination}")
+                print(f"Installed to {name}: {config_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="IDA Pro MCP Server")
-    parser.add_argument("--install", action="store_true", help="Install the MCP Server and IDA plugin")
-    parser.add_argument("--uninstall", action="store_true", help="Uninstall the MCP Server and IDA plugin")
-    parser.add_argument("--generate-docs", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--install-plugin", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--transport", type=str, default="stdio", help="MCP transport protocol to use (stdio or http://127.0.0.1:8744)")
-    parser.add_argument("--unsafe", action="store_true", help="Enable unsafe functions (DANGEROUS)")
-    parser.add_argument("--config", action="store_true", help="Generate MCP config JSON")
+    parser.add_argument("--install", action="store_true", help="Install MCP server and IDA plugin")
+    parser.add_argument("--uninstall", action="store_true", help="Uninstall MCP server and IDA plugin")
+    parser.add_argument("--transport", type=str, default="stdio", help="MCP transport (stdio or http)")
     args = parser.parse_args()
-
-    if args.install and args.uninstall:
-        print("Cannot install and uninstall at the same time")
-        return
 
     if args.install:
         install_ida_plugin()
         install_mcp_servers()
+        print("\nInstallation complete. Restart IDA Pro to load the plugin.")
         return
 
     if args.uninstall:
@@ -888,41 +1032,20 @@ def main():
         install_mcp_servers(uninstall=True)
         return
 
-    # NOTE: Developers can use this to generate the README
-    if args.generate_docs:
-        generate_readme()
-        return
-
-    # NOTE: This is silent for automated Cline installations
-    if args.install_plugin:
-        install_ida_plugin(quiet=True)
-
-    if args.config:
-        print_mcp_config()
-        return
-
-    # Remove unsafe tools
-    if not args.unsafe:
-        mcp_tools = mcp._tool_manager._tools
-        for unsafe in UNSAFE_FUNCTIONS:
-            if unsafe in mcp_tools:
-                del mcp_tools[unsafe]
-
+    # Run the MCP server
     try:
         if args.transport == "stdio":
             mcp.run(transport="stdio")
         else:
+            from urllib.parse import urlparse
             url = urlparse(args.transport)
-            if url.hostname is None or url.port is None:
-                raise Exception(f"Invalid transport URL: {args.transport}")
-            mcp.settings.host = url.hostname
-            mcp.settings.port = url.port
-            # NOTE: npx @modelcontextprotocol/inspector for debugging
-            print(f"MCP Server availabile at http://{mcp.settings.host}:{mcp.settings.port}/sse")
-            mcp.settings.log_level = "INFO"
-            mcp.run(transport="sse")
+            if url.hostname and url.port:
+                mcp.settings.host = url.hostname
+                mcp.settings.port = url.port
+                mcp.run(transport="sse")
     except KeyboardInterrupt:
         pass
+
 
 if __name__ == "__main__":
     main()
