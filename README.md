@@ -1,233 +1,193 @@
 # IDA Pro MCP
 
-Simple [MCP Server](https://modelcontextprotocol.io/introduction) to allow vibe reversing in IDA Pro.
+[MCP Server](https://modelcontextprotocol.io/introduction) for vibe reversing in IDA Pro.
 
 https://github.com/user-attachments/assets/6ebeaa92-a9db-43fa-b756-eececce2aca0
 
 The binaries and prompt for the video are available in the [mcp-reversing-dataset](https://github.com/mrexodia/mcp-reversing-dataset) repository.
 
-Available functionality:
-
-- `list_instances()`: List all IDA Pro databases currently registered by the MCP plugin along with their status, load time, PID, and runtime socket path.
-- `check_connection(database)`: Check if the IDA plugin instance handling `database` is running.
-- `batch_tool_calls(requests, page=1, page_size_tokens=25000, allow_unsafe=False)`: Execute multiple MCP tool calls in one request and automatically paginate the combined results when they exceed ~25k tokens.
-- **Important**: Every other tool accepts the target `database` filename as its first argument so the correct IDA instance is used.
-- `get_metadata(database)`: Get metadata about the current IDB.
-- `get_function_by_name(database, name)`: Get a function by its name.
-- `get_function_by_address(database, address)`: Get a function by its address.
-- `get_current_address(database)`: Get the address currently selected by the user.
-- `get_current_function(database)`: Get the function currently selected by the user.
-- `convert_number(database, text, size)`: Convert a number (decimal, hexadecimal) to different representations.
-- `list_functions(database, offset, count)`: List all functions in the database (paginated).
-- `list_globals_filter(database, offset, count, filter)`: List matching globals in the database (paginated, filtered).
-- `list_globals(database, offset, count)`: List all globals in the database (paginated).
-- `list_strings_filter(database, offset, count, filter)`: List matching strings in the database (paginated, filtered).
-- `list_strings(database, offset, count)`: List all strings in the database (paginated).
-- `list_local_types(database)`: List all Local types in the database.
-- `decompile_function(database, address)`: Decompile a function at the given address.
-- `disassemble_function(database, start_address)`: Get assembly code (address: instruction; comment) for a function.
-- `get_xrefs_to(database, address)`: Get all cross references to the given address.
-- `get_xrefs_to_field(database, struct_name, field_name)`: Get all cross references to a named struct field (member).
-- `get_entry_points(database)`: Get all entry points in the database.
-- `set_comment(database, address, comment)`: Set a comment for a given address in the function disassembly and pseudocode.
-- `rename_local_variable(database, function_address, old_name, new_name)`: Rename a local variable in a function.
-- `rename_global_variable(database, old_name, new_name)`: Rename a global variable.
-- `set_global_variable_type(database, variable_name, new_type)`: Set a global variable's type.
-- `rename_function(database, function_address, new_name)`: Rename a function.
-- `set_function_prototype(database, function_address, prototype)`: Set a function's prototype.
-- `declare_c_type(database, c_declaration)`: Create or update a local type from a C declaration.
-- `set_local_variable_type(database, function_address, variable_name, new_type)`: Set a local variable's type.
-
-Unsafe functions (`--unsafe` flag required):
-
-- `dbg_get_registers(database)`: Get all registers and their values. This function is only available when debugging.
-- `dbg_get_call_stack(database)`: Get the current call stack.
-- `dbg_list_breakpoints(database)`: List all breakpoints in the program.
-- `dbg_start_process(database)`: Start the debugger.
-- `dbg_exit_process(database)`: Exit the debugger.
-- `dbg_continue_process(database)`: Continue the debugger.
-- `dbg_run_to(database, address)`: Run the debugger to the specified address.
-- `dbg_set_breakpoint(database, address)`: Set a breakpoint at the specified address.
-- `dbg_delete_breakpoint(database, address)`: del a breakpoint at the specified address.
-- `dbg_enable_breakpoint(database, address, enable)`: Enable or disable a breakpoint at the specified address.
-
 ## Prerequisites
 
-- [Python](https://www.python.org/downloads/) (**3.11 or higher**) 
-  - Use `idapyswitch` to switch to the newest Python version
-- [IDA Pro](https://hex-rays.com/ida-pro) (8.3 or higher, 9 recommended), **IDA Free is not supported**
-- Supported MCP Client (pick one you like)
-  - [Cline](https://cline.bot)
-  - [Roo Code](https://roocode.com)
-  - [Claude](https://claude.ai/download)
-  - [Cursor](https://cursor.com)
-  - [VSCode Agent Mode](https://github.blog/news-insights/product-news/github-copilot-agent-mode-activated/)
-  - [Windsurf](https://windsurf.com)
-  - [Other MCP Clients](https://modelcontextprotocol.io/clients#example-clients): Run `ida-pro-mcp --config` to get the JSON config for your client.
+- [Python](https://www.python.org/downloads/) 3.11 or higher
+- [IDA Pro](https://hex-rays.com/ida-pro) 9.x (8.3+ may work, IDA Free is not supported)
+- A supported MCP client: [Claude](https://claude.ai/download), [Cursor](https://cursor.com), [Cline](https://cline.bot), [Roo Code](https://roocode.com), [Windsurf](https://windsurf.com), or [any other MCP client](https://modelcontextprotocol.io/clients)
 
 ## Installation
 
-Install the latest version of the IDA Pro MCP package:
+Install the package and set up the IDA plugin + MCP client configs in one step:
 
 ```sh
-pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
-```
-
-Configure the MCP servers and install the IDA Plugin:
-
-```
+pip install https://github.com/darvell/ida-pro-mcp/archive/refs/heads/main.zip
 ida-pro-mcp --install
 ```
 
-**Important**: Make sure you completely restart IDA/Visual Studio Code/Claude for the installation to take effect. Claude runs in the background and you need to quit it from the tray icon.
+This installs the IDA plugin (symlinked into your IDA plugins folder) and writes the MCP server config for Claude, Cursor, and Claude Code automatically.
 
-https://github.com/user-attachments/assets/65ed3373-a187-4dd5-a807-425dca1d8ee9
+Restart IDA and your MCP client after installing. You need to open a binary in IDA before the plugin will appear in the menu.
 
-_Note_: You need to load a binary in IDA before the plugin menu will show up.
+To uninstall:
+
+```sh
+ida-pro-mcp --uninstall
+```
+
+## SSE Transport
+
+To run the server over SSE instead of stdio (useful for remote clients):
+
+```sh
+ida-pro-mcp --transport http://127.0.0.1:8744/sse
+```
+
+## Available Tools
+
+Every tool that targets a specific IDA database accepts `database` as its first argument — pass the filename of the IDB so the server routes to the right IDA instance.
+
+### Discovery & Navigation
+
+- `list_instances()` — list all active IDA Pro instances
+- `info(database)` — database info, architecture, entry point, cursor position
+- `overview(database)` — one-call binary overview: segments, top functions, sample strings
+- `survey_binary(database)` — ranked triage: interesting strings/functions/imports by xref count
+- `get_segments(database)` — memory segments and sections
+- `list_functions(database)` — list functions with regex filter and pagination
+- `list_globals(database)` — list global variables
+- `entity_query(database, name)` — look up any named entity (function, global, import, string)
+- `func_query(database, selector)` — detailed info for a single function
+- `imports_list(database)` — all imports grouped by module
+- `imports_query(database, filter)` — search imports by name pattern
+- `search(database, query)` — search for bytes, immediates, or text patterns
+- `search_strings(database, pattern)` — find strings in the binary
+
+### Analysis
+
+- `decompile(database, selector)` — Hex-Rays pseudocode for a function
+- `decompile_batch(database, selectors)` — decompile multiple functions in one call
+- `disassemble(database, selector)` — assembly for a function or address range
+- `analyze_function_compact(database, selector)` — deep single-function analysis: decompilation, string refs, constants, callers/callees
+- `analyze_component(database, selectors)` — multi-function group analysis with call graph and shared globals
+- `get_callgraph(database, target)` — callers and/or callees as a nested tree
+- `get_xrefs(database, target)` — cross-references to or from an address
+- `basic_blocks(database, selector)` — basic block boundaries for CFG analysis
+- `find_insns(database, selector)` — find instructions matching a mnemonic or operand pattern
+- `trace_data_flow(database, start)` — BFS xref traversal forward or backward from an address
+- `infer_types(database, selector)` — auto-infer types using Hex-Rays
+
+### Memory & Data
+
+- `read_bytes(database, address)` — hex dump at an address
+- `get_int(database, address)` — read a typed integer at an address
+- `get_string(database, address)` — read a null-terminated string
+- `get_global_value(database, name)` — read a named global variable's value
+- `read_struct(database, address, struct_name)` — read memory as a struct
+
+### Renaming & Annotation
+
+- `rename(database, target, new_name)` — rename a function, global, or struct field (batch supported)
+- `set_type(database, target, type_str)` — set a function or variable type
+- `set_comment(database, address, comment)` — add a comment at an address
+- `append_comments(database, address, comment)` — append to an existing comment
+- `diff_before_after(database, selector)` — apply rename/type/comment and show before/after decompilation
+
+### Types & Structures
+
+- `create_struct(database, name, definition)` — create a struct from a C definition
+- `declare_type(database, declaration)` — register a C type declaration
+- `enum_upsert(database, name, members)` — create or update an enum
+- `type_query(database)` — query the local type library
+- `type_inspect(database, name)` — get full details of a named type
+- `type_apply_batch(database, items)` — apply types to multiple addresses at once
+- `search_structs(database, filter)` — search struct/union definitions
+
+### Stack Frames
+
+- `stack_frame(database, selector)` — get stack frame layout for a function
+- `declare_stack(database, selector, offset, name)` — add or modify a stack variable
+- `delete_stack(database, selector, offset)` — remove a stack variable
+
+### Patching
+
+- `patch_bytes(database, address, hex_bytes)` — write raw bytes
+- `put_int(database, address, value)` — write a typed integer
+- `patch_asm(database, address, assembly)` — assemble and patch an instruction
+- `define_func(database, address)` — create a function at an address
+- `define_code(database, address)` — convert bytes to instructions
+- `undefine(database, address)` — revert bytes to raw data
+
+### Scripting
+
+- `script_exec(database, script)` — execute arbitrary Python in IDA's environment
+- `py_eval(database, code)` — Jupyter-style Python expression evaluation
+- `py_exec_file(database, path)` — run a Python script file in IDA
+
+### Async Jobs
+
+Some long-running operations return a `job_id` if they time out.
+
+- `job_status(database, job_id)` — check job status
+- `job_result(database, job_id)` — retrieve job result
+
+### Utilities
+
+- `int_convert(value)` — convert between hex, decimal, octal, binary, and ASCII
+- `idb_save(database)` — save the IDA database
+- `open_file(database, path)` — launch a new IDA instance with a binary
+
+### Debugger
+
+These tools require an active debug session.
+
+- `dbg_start(database)` — start a debugger session
+- `dbg_exit(database)` — terminate the debugger
+- `dbg_continue(database)` — continue execution
+- `dbg_run_to(database, address)` — run to an address
+- `dbg_step_into(database)` — step into the next instruction
+- `dbg_step_over(database)` — step over the next instruction
+- `dbg_bps(database)` — list breakpoints
+- `dbg_add_bp(database, address)` — add a breakpoint
+- `dbg_delete_bp(database, address)` — delete a breakpoint
+- `dbg_toggle_bp(database, address)` — toggle a breakpoint
+- `dbg_regs(database)` — read general purpose registers
+- `dbg_regs_all(database)` — read all register groups
+- `dbg_stacktrace(database)` — get the call stack
+- `dbg_read(database, address)` — read memory from the debuggee
+- `dbg_write(database, address, hex_bytes)` — write memory to the debuggee
 
 ## Prompt Engineering
 
-LLMs are prone to hallucinations and you need to be specific with your prompting. For reverse engineering the conversion between integers and bytes are especially problematic. Below is a minimal example prompt, feel free to start a discussion or open an issue if you have good results with a different prompt:
+LLMs hallucinate. Be specific. A minimal starting prompt for crackme analysis:
 
-> Your task is to analyze a crackme in IDA Pro. You can use the MCP tools to retrieve information. In general use the following strategy:
-> - Inspect the decompilation and add comments with your findings
-> - Rename variables to more sensible names
-> - Change the variable and argument types if necessary (especially pointer and array types)
-> - Change function names to be more descriptive
-> - If more details are necessary, disassemble the function and add comments with your findings
-> - NEVER convert number bases yourself. Use the convert_number MCP tool if needed!
-> - Do not attempt brute forcing, derive any solutions purely from the disassembly and simple python scripts
-> - Create a report.md with your findings and steps taken at the end
-> - When you find a solution, prompt to user for feedback with the password you found
+> Analyze this binary in IDA Pro using the MCP tools.
+> - Start with `overview` or `survey_binary` to orient yourself
+> - Decompile interesting functions, add comments, rename variables
+> - Fix pointer and array types where needed
+> - Use `int_convert` for number conversion — never convert bases yourself
+> - Do not brute-force; derive solutions from the disassembly
+> - Write a report.md summarizing your findings
 
-This prompt was just the first experiment, please share if you found ways to improve the output!
+## Tips
 
-## Tips for Enhancing LLM Accuracy
-
-Large Language Models (LLMs) are powerful tools, but they can sometimes struggle with complex mathematical calculations or exhibit "hallucinations" (making up facts). Make sure to tell the LLM to use the `conver_number` MCP and you might also need [math-mcp](https://github.com/EthanHenrickson/math-mcp) for certain operations.
-
-Another thing to keep in mind is that LLMs will not perform well on obfuscated code. Before trying to use an LLM to solve the problem, take a look around the binary and spend some time (automatically) removing the following things:
-
-- String encryption
-- Import hashing
-- Control flow flattening
-- Code encryption
-- Anti-decompilation tricks
-
-You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
-
-## SSE Transport & Headless MCP
-
-You can run an SSE server to connect to the user interface like this:
-
-```sh
-uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
-```
-
-After installing [`idalib`](https://docs.hex-rays.com/user-guide/idalib) you can also run a headless SSE server:
-
-```sh
-uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
-```
-
-_Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
-
-## Manual Installation
-
-_Note_: This section is for LLMs and power users who need detailed installation instructions.
-
-<details>
-
-## Manual MCP Server Installation (Cline/Roo Code)
-
-To install the MCP server yourself, follow these steps:
-
-1. Install [uv](https://github.com/astral-sh/uv) globally:
-   - Windows: `pip install uv`
-   - Linux/Mac: `curl -LsSf https://astral.sh/uv/install.sh | sh`
-2. Clone this repository, for this example `C:\MCP\ida-pro-mcp`.
-3. Navigate to the Cline/Roo Code _MCP Servers_ configuration (see screenshot).
-4. Click on the _Installed_ tab.
-5. Click on _Configure MCP Servers_, which will open `cline_mcp_settings.json`.
-6. Add the `ida-pro-mcp` server:
-
-```json
-{
-  "mcpServers": {
-    "github.com/mrexodia/ida-pro-mcp": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "c:\\MCP\\ida-pro-mcp",
-        "run",
-        "server.py",
-        "--install-plugin"
-      ],
-      "timeout": 1800,
-      "disabled": false
-    }
-  }
-}
-```
-
-To check if the connection works you can perform the following tool call:
-
-```
-<use_mcp_tool>
-<server_name>github.com/mrexodia/ida-pro-mcp</server_name>
-<tool_name>check_connection</tool_name>
-<arguments></arguments>
-</use_mcp_tool>
-```
-
-## IDA Plugin installation
-
-The IDA Pro plugin will be installed automatically when the MCP server starts. If you disabled the `--install-plugin` option, use the following steps:
-
-1. Copy (**not move**) `src/ida_pro_mcp/mcp-plugin.py` in your plugins folder (`%appdata%\Hex-Rays\IDA Pro\plugins` on Windows).
-2. Open an IDB and click `Edit -> Plugins -> MCP` to start the server.
-
-</details>
-
-## Comparison with other MCP servers
-
-There are a few IDA Pro MCP servers floating around, but I created my own for a few reasons:
-
-1. Installation should be fully automated.
-2. The architecture of other plugins make it difficult to add new functionality quickly (too much boilerplate of unnecessary dependencies).
-3. Learning new technologies is fun!
-
-If you want to check them out, here is a list (in the order I discovered them):
-
-- https://github.com/taida957789/ida-mcp-server-plugin (SSE protocol only, requires installing dependencies in IDAPython).
-- https://github.com/fdrechsler/mcp-server-idapro (MCP Server in TypeScript, excessive boilerplate required to add new functionality).
-- https://github.com/MxIris-Reverse-Engineering/ida-mcp-server (custom socket protocol, boilerplate).
-
-Feel free to open a PR to add your IDA Pro MCP server here.
+- Run FLIRT/Lumina before starting to resolve library functions — LLMs do much better without noise from unidentified standard library code
+- Strip obfuscation (string encryption, control flow flattening, import hashing) before handing the binary to an LLM
+- Use `analyze_function_compact` or `analyze_component` for richer context in a single call
+- `decompile_batch` cuts round-trips significantly when following a call chain
 
 ## Development
 
-Adding new features is a super easy and streamlined process. All you have to do is add a new `@jsonrpc` function to [`mcp-plugin.py`](https://github.com/mrexodia/ida-pro-mcp/blob/164df8cf4ae251cc9cc0f464591fa6df8e0d9df4/src/ida_pro_mcp/mcp-plugin.py#L406-L419) and your function will be available in the MCP server without any additional boilerplate! Below is a video where I add the `get_metadata` function in less than 2 minutes (including testing):
-
-https://github.com/user-attachments/assets/951de823-88ea-4235-adcb-9257e316ae64
-
-To test the MCP server itself:
+To test the MCP server locally:
 
 ```sh
 uv run mcp dev src/ida_pro_mcp/server.py
 ```
 
-This will open a web interface at http://localhost:5173 and allow you to interact with the MCP tools for testing.
+This opens a web UI at http://localhost:5173 for interactive tool testing.
 
-For testing I create a symbolic link to the IDA plugin and then POST a JSON-RPC request directly to `http://localhost:13337/mcp`. After [enabling symbolic links](https://learn.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development) you can run the following command:
+The plugin is split into a modular package under `src/ida_pro_mcp/plugin/`. Each `api_*.py` file covers a domain (analysis, types, debug, memory, etc.). The shim `mcp-plugin.py` loads the package automatically.
 
-```sh
-uv run ida-pro-mcp --install
-```
+To add a new tool, add a `@jsonrpc` function to the appropriate `plugin/api_*.py` module and a corresponding `@mcp.tool()` wrapper in `server.py`.
 
-Generate the changelog of direct commits to `main`:
+Generate a changelog of commits since a tag:
 
 ```sh
-git log --first-parent --no-merges 1.2.0..main "--pretty=- %s"
+git log --first-parent --no-merges 2.0.0..main "--pretty=- %s"
 ```
